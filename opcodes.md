@@ -17,8 +17,8 @@ opcodes
     + 1 byte n_choices
     + \0
     + choices:
-          2 byte arg1
-        + \0 terminated string arg2
+          2 byte choice_arg1
+        + \0 terminated string choice_arg2
         + 1 byte arg3
         + 2 byte arg4                               - Possibly jump target.
         + 1 byte arg5                               - unsure, but we check if this field == 3 to decide number of bytes in the rest of the choice.
@@ -29,7 +29,7 @@ opcodes
           + 1 byte arg9
           + 2 \0 bytes.
         if nonzero:
-          if (field 5) >= 7:
+          if (arg5) >= 7:
             + \0 terminated string arg6
             + 2 bytes of padding
           + 6 bytes of padding.
@@ -40,14 +40,23 @@ opcodes
      + 2 byte arg3
      + \0                                           - idk.
 0x04: 1 byte.                                       - Does not advance IP until certain conditions are met.
-0x05: 3 bytes.                                      - idk.
-0x06: 1 + 2 byte offset                             - Unconditional jump to absolute offset within current script.
-0x07: 1 + string arg + \0                           - Go to script named "string arg".wsc, not fully sure of the diff between 0x09.
+0x05: 1
+    + 1 byte arg1
+    + \0                                            - idk.
+0x06: 1 
+    + 2 byte offset                                 - Unconditional jump to absolute offset within current script.
+0x07: 1 
+    + \0 terminated string arg1                     - Go to script named "string arg".wsc, not fully sure of the diff between 0x09.
 0x08: 2 bytes.                                      - nop
-0x09: 1 + string arg + \0                           - Go to script named "string arg".wsc
+0x09: 1 
+    + \0 terminated string arg1                     - Go to script named "string arg".wsc
 0x0A: 1                                             - Return
-0x0B: 1 + 1 byte arg1 + \0                          - 
-0x0C: 1 + 2 byte arg1 + \0                          -
+0x0B: 1 
+    + 1 byte arg1
+    + \0                                            - 
+0x0C: 1 
+    + 2 byte arg1
+    + \0                                            -
 0x0D: 1                                             - Debug print? One path outputs current opcode.
     + 2 byte arg1
     + 2 byte arg2
@@ -62,10 +71,12 @@ opcodes
     + 1 byte arg3
     + 2 byte arg4
     + 4 byte arg5
-    + \0 terminated string arg6                     - loop music file "arg6".ogg.
-    (12 + string length) 
-0x22: 1 + 1 byte arg1 + 2 byte arg2 + \0            - some file operation?
-0x23, 0x27:                                         - There's logic differentiating both opcodes, but idk what it's doing.
+    + \0 terminated string arg6                     - loop music file "arg6".ogg. 
+0x22: 1
+    + 1 byte arg1
+    + 2 byte arg2
+    + \0                                            - some file operation?
+0x23 | 0x27:                                        - There's logic differentiating both opcodes, but idk what it's doing.
       1
     + 1 byte arg1
     + 2 byte arg2
@@ -74,7 +85,8 @@ opcodes
     + 1 byte arg5                                   - There's a check for 'e' here.
     + 1 byte arg5
     + \0 terminated string arg6                     - play "arg6".ogg character voice file.
-0x24: 1 + \0                                        - Lots of sleep timers.
+0x24: 1 
+    + \0                                        - Lots of sleep timers.
 0x25: 1
     + 11 byte header
     + \0 terminated string arg1                     - Play sound effect file "arg1".
@@ -91,7 +103,7 @@ opcodes
     + 2 bytes of padding
 0x30: 1
     + 1 byte arg1
-    + 3 bytes of padding.
+    + 3 bytes of padding
 0x31: 1
     + 1 byte arg1
     + \0
