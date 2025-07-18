@@ -7,6 +7,53 @@ use walkdir::WalkDir;
 
 use crate::util::encode_sjis;
 
+fn main() {
+  env_logger::builder()
+    .format_timestamp(None)
+    .format_level(true)
+    .filter_level(log::LevelFilter::Info)
+    .init();
+  
+  let args = std::env::args().collect::<Vec<_>>();
+
+  if args.contains(&"extract_all".to_string()) {
+    extract_all_arcs();
+  } else if args.contains(&"extract".to_string()) {
+    if args.len() < 5 {
+      log::error!("argument order is: ccfkb extract <arc file> <-o or --output> <output folder name>");
+      exit(1);
+    }
+
+    let arc_name = &args[2];
+  
+    let arc_name_path = PathBuf::from(arc_name).canonicalize().unwrap();
+
+    if args[3] != "--output" && args[3] != "-o" {
+      log::error!("argument order is: ccfkb extract <arc file> -o/--output <output folder name>");
+      exit(1);
+    }
+  
+    let out_dir = &args[4];
+
+    let out_dir_path = current_dir();
+    let out_dir_path = out_dir_path
+        .unwrap()
+        .join(out_dir)
+        .canonicalize()
+        .unwrap();
+
+    create_dir_all(&out_dir_path).unwrap();
+
+    let mut file = std::fs::read(&arc_name_path).unwrap();
+    
+    let path = out_dir_path.join(&arc_name_path.file_name().unwrap());
+    std::fs::create_dir_all(&path).unwrap();
+    read_arc(&mut file[..], path, false);
+  } 
+
+}
+
+
 fn get_final_file_list<T>(input_files: Vec<T>, recurse_dirs: bool, action: &str) -> Vec<PathBuf>
 where
   T: AsRef<Path> + Sync + Send,
@@ -51,39 +98,9 @@ where
   output
 }
 
-fn main() {
-  env_logger::builder().format_timestamp(None).init();
-  let args = std::env::args().collect::<Vec<_>>();
-
-  if args.contains(&"extract_all".to_string()) {
-    extract_all_arcs();
-  } else if args.contains(&"extract".to_string()) {
-    let arc_name = &args[2];
-  
-    if args[3] != "--output" && args[3] != "-o" {
-      log::error!("specify output argument as -o/--output, followed by the output file.");
-      exit(1);
-    }
-  
-    let out_dir = &args[4];
-
-    let out_dir_path = current_dir()
-        .unwrap()
-        .join(out_dir)
-        .canonicalize()
-        .unwrap();
-
-    create_dir_all(&out_dir_path).unwrap();
-
-    
-    
-  } 
-
-}
-
 fn extract_all_arcs() {
-    std::fs::create_dir_all("unpacked_arcs").unwrap();
-  let files = walkdir::WalkDir::new("/home/wscp/cc-fkb-tools/cross channel fkb/").into_iter().filter_map(|it| it.ok()).collect::<Vec<_>>();
+  std::fs::create_dir_all("unpacked_arcs").unwrap();
+  let files = walkdir::WalkDir::new("C:/Users/warps/Desktop/cross-channel-fkb").into_iter().filter_map(|it| it.ok()).collect::<Vec<_>>();
   for i in files.iter() {
     let dirent = i;
     let pth = dirent.path();
