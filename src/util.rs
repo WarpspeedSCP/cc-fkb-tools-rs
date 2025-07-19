@@ -108,6 +108,7 @@ fn tokens(unicode: &str) -> Vec<String> {
   result
 }
 
+/// Does not null terminate the resultant string.
 pub fn encode_sjis(unicode: &str) -> Vec<u8> {
   use encoding_rs::SHIFT_JIS;
   let mut in_italics = false;
@@ -143,7 +144,6 @@ pub fn encode_sjis(unicode: &str) -> Vec<u8> {
 
     if in_italics {
       let mut word = vec![];
-      for chr in substr.chars() {}
       let output = word;
       collector.push(output);
     } else {

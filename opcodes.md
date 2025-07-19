@@ -5,7 +5,7 @@ opcodes
      + 2 byte arg1
      + 2 byte arg2
      + jump offset (4 byte)
-     + \0                                           - arg2 is offset if branch type has bit 5 set to 1.
+     + \0                                           - arg2 is offset to stored variable if branch type has bit 5 set to 1.
     - Branch types:
       - 1 => GE
       - 2 => LE
@@ -87,7 +87,10 @@ opcodes
     + \0 terminated string arg6                     - play "arg6".ogg character voice file.
 0x24: 1 
     + \0                                        - Lots of sleep timers.
-0x25: 1
+0x25: 1 A_B_CC_pp_D_EE_F
+    + 1 byte arg1
+    + 1 byte arg2
+    + 2 byte arg3
     + 11 byte header
     + \0 terminated string arg1                     - Play sound effect file "arg1".
 0x26: 1
@@ -148,13 +151,13 @@ opcodes
     + 1 byte arg2
     + 1 byte arg3
     + \0
-0x46: 1 
+0x46: 1 AA_BB_ppp_C_D_s
     + 9 byte header
     + \0 terminated string arg1                     - Load file named "string arg".png
 0x47: 1
     + 1 byte arg1
     + \0
-0x48: 1
+0x48: 1 A_BB_CC_DDDD_E_F
     + 11 byte header
     + \0
 0x49: 1 + 2 byte arg1 + \0                          - arg1 seems to be a count of some kind.

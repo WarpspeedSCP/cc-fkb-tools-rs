@@ -15,7 +15,7 @@ use util::{get_sjis_bytes, get_sjis_bytes_of_length, transmute_to_u32};
 use walkdir::WalkDir;
 use data::{BMP_Dib_V3_Header, BMP_Header, ExtensionDescriptor, FileDescriptor, WIPFHeader, WIPFENTRY};
 use crate::data::{extract_all_arcs, read_arc, write_arc};
-use crate::opcodes::make_opcode;
+use crate::opcodes::{make_opcode, OpField, Opcode, Script};
 use crate::util::encode_sjis;
 
 fn main() {
@@ -24,38 +24,57 @@ fn main() {
     .format_level(true)
     .filter_level(log::LevelFilter::Info)
     .init();
-
-  let input = std::fs::read("/home/wscp.homedir/cc-fkb-tools/ccfkb_pack/output/Rio.arc/BGM_CLK.WSC").unwrap();
-  let mut ptr = 0;
-  let mut ptr_old = ptr;
-  let mut opcodes = vec![];
-  let mut at_end = false;
-  
-  while ptr < input.len() {
-    if at_end {
-      opcodes.push(input[ptr..].to_vec());
-      break;
+  let files = walkdir::WalkDir::new(current_dir().unwrap().join("output/Rio.arc"))
+      .into_iter()
+      .filter_map(|it| it.ok())
+      .map(|it| it.into_path())
+      .collect::<Vec<_>>();
+  for file in files {
+    if !file.extension().unwrap().to_string_lossy().ends_with("WSC") {
+      continue;
     }
+    log::info!("Decoding file {}", file.file_name().unwrap().to_string_lossy());
+    let input = std::fs::read(file.clone()).unwrap();
 
-    let op = make_opcode(&input[ptr..]);
-    if let Some(op) = op {
-      log::info!("Got 0x{:02X} of length 0x{:02X} at 0x{:08X}", op[0], op.len(), ptr);
-      at_end = op[0] == 0xFF;
-      ptr += op.len();
-      opcodes.push(op);
-    } else {
-      ptr_old = ptr;
-      log::error!("Unknown opcode at 0x{:08X}", ptr);
-    }
+    let mut ptr = 0;
+    let mut ptr_old = 1;
+    let mut opcodes = vec![];
+    let mut at_end = false;
 
-    if ptr_old == ptr {
-      break;
+    while ptr < input.len() {
+      if ptr_old == ptr {
+        break;
+      }
+
+      let op = make_opcode(&input[ptr..], ptr);
+      if let Some(op) = op {
+        log::info!("Got 0x{:02X} of length 0x{:02X} at 0x{:08X}", op.opcode, op.size(), ptr);
+        at_end = op.opcode == 0xFF;
+        ptr += op.size();
+        opcodes.push(op);
+      } else {
+        ptr_old = ptr;
+        log::error!("Unknown opcode at 0x{:08X}", ptr);
+      }
     }
+    
+    let rest = input[ptr..].to_vec();
+    
+    let out = Script {
+      opcodes,
+      trailer: rest
+    };
+
+    let res = serde_yml::to_string(&out).unwrap()    .replace("'[", "[")
+        .replace("]'", "]")
+        .replace(r#"'""#, "")
+        .replace(r#""'"#, "");
+
+    let new = serde_yml::from_str::<Vec<Opcode>>(&res);
+
+    std::fs::write(file.with_extension("WSC.yaml"), res).unwrap();
+
   }
-
-  let res = serde_json::to_string(&opcodes).unwrap();
-
-  std::fs::write("/home/wscp.homedir/cc-fkb-tools/ccfkb_pack/output/Rio.arc/BGM_CLK.WSC.json", res).unwrap();
 
   return;
 
