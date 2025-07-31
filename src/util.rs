@@ -10,6 +10,21 @@ pub fn transmute_to_u16(address: usize, input: &[u8]) -> u16 {
   u16::from_le_bytes(transmute_to_array(address, input))
 }
 
+pub fn escape_str(input: &str) -> String {
+  (input.to_string() + "%K%P")
+      .replace("\\", "<bslash/>")
+      .replace("\"", "<dquote/>")
+      .trim()
+      .to_string()
+}
+
+pub fn unescape_str(input: &str) -> String {
+  input
+      .trim_end_matches("%K%P")
+      .replace("<bslash/>", "\\")
+      .replace("<dquote/>", "\"")
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum SJISChar {
   SingleByte(u8),
@@ -93,6 +108,10 @@ fn tokens(unicode: &str) -> Vec<String> {
         curr_str = "\\*".to_owned();
       } else {
         curr_str.push('\\');
+        if let Some(c) = chrs.get(char_idx) {
+          char_idx += 1;
+          curr_str.push(*c);
+        }
       }
       result.push(std::mem::take(&mut curr_str));
     } else if chr == '*' {

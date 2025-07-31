@@ -1,6 +1,19 @@
-use std::path::{Path, PathBuf};
+use crate::opcodes::{Choice, OpField, Script, TLString, make_opcode};
+use crate::util::{
+  encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32, unescape_str,
+  unwipf,
+};
+use nom::IResult;
+use nom::branch::alt;
+use nom::bytes::complete::{tag, take_till, take_until, take_while, take_while_m_n};
+use nom::combinator::{map_res, not, opt, value};
+use nom::multi::{many0, separated_list0};
+use nom::sequence::{preceded, terminated};
+use nom::{AsChar, Parser};
+use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
-use crate::util::{to_bytes, unwipf, encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, transmute_to_u32};
+use std::fmt::Formatter;
+use std::path::{Path, PathBuf};
 
 #[repr(C, packed)]
 pub struct WIPFHeader {
@@ -23,7 +36,7 @@ impl WIPFHeader {
 }
 
 #[repr(C, packed)]
-pub struct BMP_Header {
+pub struct BMPHeader {
   magic: [u8; 2],
   filesz: u32,
   res1: u16,
@@ -32,7 +45,7 @@ pub struct BMP_Header {
 }
 
 #[repr(C, packed)]
-pub struct BMP_Dib_V3_Header {
+pub struct BMPDibV3Header {
   header_sz: u32,
   width: u32,
   height: u32,
@@ -117,17 +130,17 @@ impl FileDescriptor {
 pub fn extract_all_arcs() {
   std::fs::create_dir_all("unpacked_arcs").unwrap();
   let files = walkdir::WalkDir::new("C:/Users/warps/Desktop/cross-channel-fkb")
-      .into_iter()
-      .filter_map(|it| it.ok())
-      .collect::<Vec<_>>();
+    .into_iter()
+    .filter_map(|it| it.ok())
+    .collect::<Vec<_>>();
   for i in files.iter() {
     let dirent = i;
     let pth = dirent.path();
     if !pth
-        .extension()
-        .map(|it| it.to_string_lossy().to_owned())
-        .unwrap_or_default()
-        .ends_with("arc")
+      .extension()
+      .map(|it| it.to_string_lossy().to_owned())
+      .unwrap_or_default()
+      .ends_with("arc")
     {
       continue;
     }
@@ -144,16 +157,16 @@ pub fn extract_all_arcs() {
 pub fn write_arc(input_folder: &Path) -> Vec<u8> {
   let mut output = vec![];
 
-  let extensions = std::fs::read_to_string(input_folder.join("extensions.json"))
-      .iter()
-      .flat_map(|str| serde_json::from_str::<Vec<ExtensionDescriptor>>(&str))
-      .next()
-      .unwrap_or_default();
-  let files = std::fs::read_to_string(input_folder.join("files.json"))
-      .iter()
-      .flat_map(|str| serde_json::from_str::<Vec<(String, FileDescriptor)>>(&str))
-      .next()
-      .unwrap_or_default();
+  let extensions = std::fs::read_to_string(input_folder.join("extensions.yaml"))
+    .iter()
+    .flat_map(|str| serde_yml::from_str::<Vec<ExtensionDescriptor>>(&str))
+    .next()
+    .unwrap_or_default();
+  let files = std::fs::read_to_string(input_folder.join("files.yaml"))
+    .iter()
+    .flat_map(|str| serde_yml::from_str::<Vec<(String, FileDescriptor)>>(&str))
+    .next()
+    .unwrap_or_default();
 
   output.extend((extensions.len() as u32).to_le_bytes());
 
@@ -170,7 +183,7 @@ pub fn write_arc(input_folder: &Path) -> Vec<u8> {
   for (filename, descriptor) in files {
     let mut sjis_name = encode_sjis(&descriptor.name);
     let sjis_name = if sjis_name.len() < 13 {
-      sjis_name.extend(vec![ 0u8; 13 - sjis_name.len() ]);
+      sjis_name.extend(vec![0u8; 13 - sjis_name.len()]);
       sjis_name
     } else {
       sjis_name
@@ -181,8 +194,8 @@ pub fn write_arc(input_folder: &Path) -> Vec<u8> {
 
     if filename.ends_with("WSC") {
       contents
-          .iter_mut()
-          .for_each(|chr| *chr = chr.rotate_left(2));
+        .iter_mut()
+        .for_each(|chr| *chr = chr.rotate_left(2));
     }
 
     output.extend(&(contents.len() as u32).to_le_bytes());
@@ -225,9 +238,9 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
   let ext_descriptors_out_file = out_folder.join("extensions.json");
   std::fs::write(
     &ext_descriptors_out_file,
-    serde_json::to_string_pretty(&ext_descriptors).unwrap(),
+    serde_yml::to_string(&ext_descriptors).unwrap(),
   )
-      .unwrap();
+  .unwrap();
 
   log::info!(
     "There are {} files to process.",
@@ -236,11 +249,12 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
 
   let mut files = vec![];
 
-  let ext_descriptors_out_file = out_folder.join("extensions.json");
+  let ext_descriptors_out_file = out_folder.join("extensions.yaml");
   std::fs::write(
     &ext_descriptors_out_file,
-    serde_json::to_string_pretty(&ext_descriptors).unwrap(),
-  ).unwrap();
+    serde_yml::to_string(&ext_descriptors).unwrap(),
+  )
+  .unwrap();
 
   for descriptor in ext_descriptors.iter() {
     let start_addr = descriptor.offset as usize;
@@ -263,12 +277,12 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
     }
   }
 
-  let file_descriptors_out_file = out_folder.join("files.json");
+  let file_descriptors_out_file = out_folder.join("files.yaml");
   std::fs::write(
     &file_descriptors_out_file,
-    serde_json::to_string_pretty(&files).unwrap(),
+    serde_yml::to_string(&files).unwrap(),
   )
-      .unwrap();
+  .unwrap();
 
   for (filename, desc) in files {
     log::info!("Processing {filename}.");
@@ -279,12 +293,12 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
 
     if filename.ends_with("WSC") {
       content
-          .iter_mut()
-          .for_each(|chr| *chr = chr.rotate_right(2));
+        .iter_mut()
+        .for_each(|chr| *chr = chr.rotate_right(2));
     } else if &content[..4] == "WIPF".as_bytes() && extract_wipf {
       let header = WIPFHeader::from_ref(content);
       let entries =
-          WIPFENTRY::from_ref_as_slice(&content[size_of_val(header)..], header.n_entries as usize);
+        WIPFENTRY::from_ref_as_slice(&content[size_of_val(header)..], header.n_entries as usize);
 
       log::warn!(
         "WIPF file {filename} has {} entries with depth {}.",
@@ -361,11 +375,11 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
         for i in 0..(entry.height / 2) as usize {
           for j in 0..(entry.width * out_depth) as usize {
             let a = out_buf
-                [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j];
+              [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j];
             let b = out_buf[i * entry.width as usize * out_depth as usize + j];
 
             out_buf
-                [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j] = b;
+              [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j] = b;
             out_buf[i * entry.width as usize * out_depth as usize + j] = a;
           }
         }
@@ -376,7 +390,7 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
           (0x36 + out_buf.len(), 0x36, out_buf.len())
         };
 
-        let bmp_header = BMP_Header {
+        let bmp_header = BMPHeader {
           magic: ['B' as u8, 'M' as u8],
           filesz: file_size as u32,
           res1: 0,
@@ -384,7 +398,7 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
           offset: bmp_offset,
         };
 
-        let bmp_dib_header = BMP_Dib_V3_Header {
+        let bmp_dib_header = BMPDibV3Header {
           header_sz: 0x28,
           width: entry.width,
           height: entry.height,
@@ -404,18 +418,447 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
         std::fs::write(
           out_file,
           hdr_bytes
-              .iter()
-              .chain(dib_bytes)
-              .chain(if header.depth == 8 { palette } else { &[] })
-              .chain(out_buf.iter())
-              .copied()
-              .collect::<Vec<u8>>(),
+            .iter()
+            .chain(dib_bytes)
+            .chain(if header.depth == 8 { palette } else { &[] })
+            .chain(out_buf.iter())
+            .copied()
+            .collect::<Vec<u8>>(),
         )
-            .unwrap();
+        .unwrap();
       }
       continue;
     }
 
     std::fs::write(output_file_path, content).unwrap();
   }
+}
+
+pub fn decode_wsc(input: &[u8]) -> Script {
+  let mut ptr = 0;
+  let mut ptr_old = 1;
+  let mut opcodes = vec![];
+  let mut at_end = false;
+
+  while ptr < input.len() {
+    if ptr_old == ptr {
+      break;
+    }
+
+    let op = make_opcode(&input[ptr..], ptr);
+    if let Some(op) = op {
+      log::debug!(
+        "Got 0x{:02X} of length 0x{:02X} at 0x{:08X}",
+        op.opcode,
+        op.size(),
+        ptr
+      );
+      at_end = op.opcode == 0xFF;
+      ptr += op.size();
+      opcodes.push(op);
+    } else {
+      ptr_old = ptr;
+      log::error!("Unknown opcode at 0x{:08X}", ptr);
+    }
+    if at_end {
+      break;
+    }
+  }
+
+  let rest = input[ptr..].to_vec();
+
+  let out = Script {
+    opcodes,
+    trailer: rest,
+  };
+
+  out
+}
+
+const TL_CHOICE_END: Lazy<String> = Lazy::new(|| "---~~~---".to_string());
+const TL_LINE_END: Lazy<String> = Lazy::new(|| "---===---".to_string());
+
+pub fn tl_transform_script(input: &Script) -> String {
+  let mut lines = vec![];
+
+  let mut curr_speaker = ("", String::default(), &0);
+  for opcode in input.opcodes.iter() {
+    if ![0x41, 0x42, 0x02].contains(&opcode.opcode) {
+      continue;
+    }
+
+    match opcode.opcode {
+      0x42 => {
+        let address = opcode.address;
+        let mut thing = opcode.fields.iter().filter_map(|it| match it {
+          OpField::String(it) => Some(it),
+          _ => None,
+        });
+
+        let speaker_tl_string = thing.next().unwrap();
+        let tl_string = thing.next().unwrap();
+        
+        let docline = DocLine::SpeakerLine(SpeakerLine {
+          speaker_translation: speaker_tl_string.clone(),
+          address: address as u32,
+          translation: tl_string.clone(),
+          speaker_address: address as u32,
+        });
+
+        lines.push(docline.to_string());
+
+        
+      }
+      // Textbox with no speaker.
+      0x41 => {
+        let address = opcode.address;
+        let tl_string = opcode
+          .fields
+          .iter()
+          .find_map(|it| match it {
+            OpField::String(it) => Some(it),
+            _ => None,
+          })
+          .unwrap();
+        
+        let docline = DocLine::Line(Line {
+          translation: tl_string.clone(),
+          address: address as u32,
+        });
+        lines.push(docline.to_string());
+      }
+      0x02 => {
+        let address = opcode.address;
+        let choices = opcode
+          .fields
+          .iter()
+          .find_map(|it| match it {
+            OpField::Choice(it) => Some(it),
+            _ => None,
+          })
+          .unwrap();
+
+        let docline = DocLine::Choices(ChoiceLine {
+          address: address as u32,
+          choices: choices
+            .iter()
+            .map(|Choice { choice_str, .. }| choice_str.clone())
+            .collect(),
+        });
+        lines.push(docline.to_string());
+      }
+      _ => continue,
+    }
+    lines.push(TL_LINE_END.clone());
+    lines.push("\n".to_string());
+  }
+
+  lines.join("\n")
+}
+
+fn is_hex_digit_a(c: char) -> bool {
+  c.is_digit(16) || c == 'x'
+}
+
+pub fn hex_int(input: &str) -> IResult<&str, u32> {
+  map_res(take_while(is_hex_digit_a), |it: &str| {
+    u32::from_str_radix(it.trim_start_matches("0x"), 16)
+  })
+  .parse(input)
+}
+
+pub enum TLTag {
+  Speaker { address: u32 },
+  Text { address: u32 },
+  Choice { address: u32 },
+}
+
+pub fn tltag(input: &str) -> IResult<&str, TLTag> {
+  map_res(
+    alt((
+      terminated(
+        (value("text", tag("[original text @ ")), hex_int),
+        tag("]:"),
+      ),
+      terminated((value("speaker", tag("[speaker @ ")), hex_int), tag("]:")),
+      terminated((value("choice", tag("[choices @ ")), hex_int), tag("]")),
+    )),
+    |(enum_thing, address)| match enum_thing {
+      "text" => Ok(TLTag::Text { address }),
+      "speaker" => Ok(TLTag::Speaker { address }),
+      "choice" => Ok(TLTag::Choice { address }),
+      _ => Err("Bad input."),
+    },
+  )
+  .parse(input)
+}
+
+#[derive(Default, Debug)]
+struct Line {
+  address: u32,
+  translation: TLString,
+}
+
+#[derive(Default, Debug)]
+struct SpeakerLine {
+  address: u32,
+  speaker_address: u32,
+  speaker_translation: TLString,
+  translation: TLString,
+}
+
+#[derive(Default, Debug)]
+struct ChoiceLine {
+  address: u32,
+  choices: Vec<TLString>,
+}
+
+#[derive(Debug)]
+pub enum DocLine {
+  Line(Line),
+  SpeakerLine(SpeakerLine),
+  Choices(ChoiceLine),
+}
+
+impl std::fmt::Display for DocLine {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    match self {
+      DocLine::Line(Line {
+        address,
+        translation:
+          TLString {
+            translation: tl_text,
+            raw,
+            notes: note_text,
+          },
+      }) => {
+        write!(
+          f,
+          r#"[original text @ 0x{address:08X}]: {raw}
+[translation]: {}
+[notes]: {}
+"#,
+          tl_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default(),
+          note_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default()
+        )
+      }
+      DocLine::SpeakerLine(SpeakerLine {
+        speaker_translation:
+          TLString {
+            raw: speaker_raw,
+            translation: speaker_translation,
+            ..
+          },
+        address,
+        speaker_address,
+        translation:
+          TLString {
+            translation: tl_text,
+            raw,
+            notes: note_text,
+          },
+      }) => {
+        write!(
+          f,
+          r#"[speaker @ 0x{address:08X}]: {} ({})
+[original text @ 0x{speaker_address:08X}]: {raw}
+[translation]: {}
+[notes]: {}
+"#,
+          speaker_translation
+            .as_ref()
+            .map(|it| it.as_str())
+            .unwrap_or_default(),
+          speaker_raw.trim(),
+          tl_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default(),
+          note_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default()
+        )
+      }
+      DocLine::Choices(ChoiceLine { address, choices }) => {
+        write!(f, "[choices @ 0x{address:08X}]\n")?;
+        for TLString {
+          raw,
+          notes,
+          translation,
+        } in choices.iter()
+        {
+          let raw = unescape_str(raw);
+          let tl_text = translation
+            .as_ref()
+            .map(|it| unescape_str(it.as_str().trim()))
+            .unwrap_or_default();
+          let note_text = notes
+            .as_ref()
+            .map(|it| unescape_str(it.as_str().trim()))
+            .unwrap_or_default();
+          write!(f, "[choice original text]: {raw}\n")?;
+          write!(f, "[choice translation]: {tl_text}\n")?;
+          write!(f, "[choice notes]: {note_text}\n")?;
+          write!(f, "{}\n", TL_CHOICE_END.clone())?;
+        }
+        Ok(())
+      }
+    }?;
+    write!(f, "{}\n\n", TL_LINE_END.as_str())
+  }
+}
+
+impl DocLine {
+  fn line_type_string(&self) -> &str {
+    match self {
+      DocLine::Line(_) => "Line",
+      DocLine::SpeakerLine(_) => "SpeakerLine",
+      DocLine::Choices(_) => "Choices",
+    }
+  }
+
+  fn address(&self) -> u32 {
+    match self {
+      DocLine::Line(Line { address, .. }) => *address,
+      DocLine::SpeakerLine(SpeakerLine { address, .. }) => *address,
+      DocLine::Choices(ChoiceLine { address, .. }) => *address,
+    }
+  }
+}
+
+fn is_blank(input: &str) -> bool {
+  input.is_empty() || input.chars().all(|it| it.is_space() || it.is_newline())
+}
+
+pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
+  let (rest, (tl_tag, header_contents)) = (tltag, take_until("\n[")).parse(input)?;
+
+  let (rest, mut docline) = match tl_tag {
+    TLTag::Speaker { address } => {
+      let (_, (tl, raw)) = map_res(
+        (take_until("("), tag("("), take_until(")"), tag(")")),
+        |it| Ok::<(&str, &str), &str>((it.0, it.2)),
+      )
+      .parse(header_contents)?;
+
+      let mut this_line = SpeakerLine::default();
+      this_line.speaker_address = address;
+
+      this_line.speaker_translation = TLString {
+        translation: if is_blank(tl) {
+          None
+        } else {
+          Some(tl.trim().to_string())
+        },
+        notes: None,
+        raw: raw.trim().to_string(),
+      };
+
+      let (rest, _) = take_until("[").parse(rest)?;
+
+      if let (rest, (TLTag::Text { address: text_addr }, raw)) =
+        (tltag, take_until("\n[")).parse(rest)?
+      {
+        this_line.address = text_addr;
+
+        if !is_blank(raw) {
+          this_line.translation.raw = raw.trim().to_string();
+        }
+
+        (rest, DocLine::SpeakerLine(this_line))
+      } else {
+        (rest, DocLine::SpeakerLine(this_line))
+      }
+    }
+    TLTag::Text { address } => {
+      let mut textline = Line::default();
+      textline.address = address;
+
+      let (rest, _) = take_until("\n[").parse(rest)?;
+
+      if !is_blank(header_contents) {
+        textline.translation.raw = header_contents.trim().to_string();
+      }
+
+      (rest, DocLine::Line(textline))
+    }
+    TLTag::Choice { address } => {
+      let mut choiceline = ChoiceLine::default();
+      choiceline.address = address;
+
+      let (rest, stuff) = many0(terminated(
+        (
+          preceded(tag("\n[choice original text]:"), take_until("\n[")),
+          (
+            preceded(tag("\n[choice translation]:"), take_until("\n[")),
+            preceded(
+              tag("\n[choice notes]:"),
+              terminated(take_until("\n---"), take_until(TL_CHOICE_END.as_str())),
+            ),
+          ),
+        ),
+        tag(TL_CHOICE_END.as_str()),
+      ))
+      .parse(rest)?;
+
+      for (raw, (choice_tl, choice_notes)) in stuff {
+        let translation = if is_blank(choice_tl) {
+          None
+        } else {
+          Some(choice_tl.trim().to_string())
+        };
+
+        let notes = if is_blank(choice_notes) {
+          None
+        } else {
+          Some(choice_notes.trim().to_string())
+        };
+
+        choiceline.choices.push(TLString {
+          raw: raw.trim().to_string(),
+          translation,
+          notes,
+        });
+      }
+
+      (rest, DocLine::Choices(choiceline))
+    }
+  };
+
+  let (rest, (tl, notes)) = terminated(
+    alt((
+      (
+        preceded(tag("\n[translation]:"), take_until("\n[")),
+        preceded(tag("\n[notes]:"), take_until(TL_LINE_END.as_str())),
+      ),
+      value(("", ""), tag("\n")),
+    )),
+    tag(TL_LINE_END.as_str()),
+  )
+  .parse(rest)?;
+
+  if !is_blank(tl) {
+    match docline {
+      DocLine::Line(ref mut line) => {
+        line.translation.translation = Some(tl.trim().to_string());
+      }
+      DocLine::SpeakerLine(ref mut line) => {
+        line.translation.translation = Some(tl.trim().to_string());
+      }
+      _ => {}
+    }
+  }
+
+  if !is_blank(notes) {
+    match docline {
+      DocLine::Line(ref mut line) => {
+        line.translation.notes = Some(notes.trim().to_string());
+      }
+      DocLine::SpeakerLine(ref mut line) => {
+        line.translation.notes = Some(notes.trim().to_string());
+      }
+      _ => {}
+    }
+  }
+
+  Ok((rest, docline))
+}
+
+pub fn parse_doclines(input: &str) -> IResult<&str, Vec<DocLine>> {
+  separated_list0(take_until("["), parse_docline_group).parse(input)
 }

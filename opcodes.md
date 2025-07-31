@@ -499,7 +499,7 @@ opcodes
     + 1 byte arg3
     + 2 byte arg4
     + \0
-0xE0: 1
+0xE0: 1                                             - Set scene text? 
     + \0 terminated string arg1
 0xE2: 1
     + \0

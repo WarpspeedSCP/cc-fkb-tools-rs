@@ -2,21 +2,15 @@ mod util;
 mod data;
 mod opcodes;
 
-use serde_derive::{Deserialize, Serialize};
 use std::{
-  collections::HashMap,
   env::current_dir,
   fs::create_dir_all,
   path::{Path, PathBuf},
   process::exit,
 };
-use serde_json_fmt::JsonFormat;
 use util::{get_sjis_bytes, get_sjis_bytes_of_length, transmute_to_u32};
 use walkdir::WalkDir;
-use data::{BMP_Dib_V3_Header, BMP_Header, ExtensionDescriptor, FileDescriptor, WIPFHeader, WIPFENTRY};
-use crate::data::{extract_all_arcs, read_arc, write_arc};
-use crate::opcodes::{make_opcode, OpField, Opcode, Script};
-use crate::util::encode_sjis;
+use crate::data::{decode_wsc, extract_all_arcs, read_arc, tl_transform_script, write_arc};
 
 fn main() {
   env_logger::builder()
@@ -24,59 +18,6 @@ fn main() {
     .format_level(true)
     .filter_level(log::LevelFilter::Info)
     .init();
-  let files = walkdir::WalkDir::new(current_dir().unwrap().join("output/Rio.arc"))
-      .into_iter()
-      .filter_map(|it| it.ok())
-      .map(|it| it.into_path())
-      .collect::<Vec<_>>();
-  for file in files {
-    if !file.extension().unwrap().to_string_lossy().ends_with("WSC") {
-      continue;
-    }
-    log::info!("Decoding file {}", file.file_name().unwrap().to_string_lossy());
-    let input = std::fs::read(file.clone()).unwrap();
-
-    let mut ptr = 0;
-    let mut ptr_old = 1;
-    let mut opcodes = vec![];
-    let mut at_end = false;
-
-    while ptr < input.len() {
-      if ptr_old == ptr {
-        break;
-      }
-
-      let op = make_opcode(&input[ptr..], ptr);
-      if let Some(op) = op {
-        log::info!("Got 0x{:02X} of length 0x{:02X} at 0x{:08X}", op.opcode, op.size(), ptr);
-        at_end = op.opcode == 0xFF;
-        ptr += op.size();
-        opcodes.push(op);
-      } else {
-        ptr_old = ptr;
-        log::error!("Unknown opcode at 0x{:08X}", ptr);
-      }
-    }
-    
-    let rest = input[ptr..].to_vec();
-    
-    let out = Script {
-      opcodes,
-      trailer: rest
-    };
-
-    let res = serde_yml::to_string(&out).unwrap()    .replace("'[", "[")
-        .replace("]'", "]")
-        .replace(r#"'""#, "")
-        .replace(r#""'"#, "");
-
-    let new = serde_yml::from_str::<Vec<Opcode>>(&res);
-
-    std::fs::write(file.with_extension("WSC.yaml"), res).unwrap();
-
-  }
-
-  return;
 
   let args = std::env::args().collect::<Vec<_>>();
 
@@ -140,50 +81,177 @@ fn main() {
     let data = write_arc(&arc_name_path);
     std::fs::write(output, data).unwrap();
   } else if args.contains(&"decode".to_string()) {
+    if args.len() < 5 {
+      log::error!(
+        "argument order is: ccfkb decode <wsc file> <-o or --output> <output directory name>"
+      );
+      exit(1);
+    }
+
+    let wsc_name = &args[2];
+
+    let wsc_name_path = current_dir()
+        .unwrap()
+        .join(wsc_name)
+        .canonicalize()
+        .map_err(|err| log::error!("The input file {wsc_name} does not exist! error: {err}"))
+        .unwrap();
+
+    if args[3] != "--output" && args[3] != "-o" {
+      log::error!("argument order is: ccfkb decode <wsc file> <-o or --output> <output directory name>");
+      exit(1);
+    }
+
+    let out_dir = &args[4];
+
+    let out_dir_path = current_dir().unwrap().join(out_dir);
+    create_dir_all(&out_dir_path).unwrap();
+
+    decode_wsc_file_command(&wsc_name_path, &out_dir_path);
+  } else if args.contains(&"decode-all".to_string()) {
+    if args.len() < 5 {
+      log::error!(
+        "argument order is: ccfkb decode-all <wsc directory name> <-o or --output> <output directory name>"
+      );
+      exit(1);
+    }
+
+    let wsc_name = &args[2];
+
+    let wsc_name_path = current_dir()
+        .unwrap()
+        .join(wsc_name)
+        .canonicalize()
+        .map_err(|err| log::error!("The input directory {wsc_name} does not exist! error: {err}"))
+        .unwrap();
+
+    if args[3] != "--output" && args[3] != "-o" {
+      log::error!("argument order is: ccfkb decode-all <wsc directory name> <-o or --output> <output directory name>");
+      exit(1);
+    }
+
+    let out_dir = &args[4];
     
+    let out_dir_path = current_dir().unwrap().join(out_dir);
+    create_dir_all(&out_dir_path).unwrap();
+
+    let files = walkdir::WalkDir::new(&wsc_name_path)
+        .into_iter()
+        .filter_map(|it| it.ok())
+        .map(|it| it.into_path())
+        .collect::<Vec<_>>();
+    for file in files {
+      if !file.extension().unwrap().to_string_lossy().ends_with("WSC") {
+        continue;
+      }
+      
+      decode_wsc_file_command(&file, &out_dir_path)
+
+    }
+  } else if args.contains(&"transform".to_string()){
+    if args.len() < 5 {
+      log::error!(
+        "argument order is: ccfkb transform <yaml file> <-o or --output> <output directory name>"
+      );
+      exit(1);
+    }
+
+    let wsc_name = &args[2];
+
+    let wsc_name_path = current_dir()
+        .unwrap()
+        .join(wsc_name)
+        .canonicalize()
+        .map_err(|err| log::error!("The input file {wsc_name} does not exist! error: {err}"))
+        .unwrap();
+
+    if args[3] != "--output" && args[3] != "-o" {
+      log::error!("argument order is: ccfkb transform <yaml file> <-o or --output> <output directory name>");
+      exit(1);
+    }
+
+    let out_dir = &args[4];
+
+    let out_dir_path = current_dir().unwrap().join(out_dir);
+    create_dir_all(&out_dir_path).unwrap();
+
+    transform_wsc_file_command(&wsc_name_path, &out_dir_path.canonicalize().unwrap());
+    
+  } else if args.contains(&"transform-all".to_string()){
+    if args.len() < 5 {
+      log::error!(
+        "argument order is: ccfkb transform-all <yaml file> <-o or --output> <output directory name>"
+      );
+      exit(1);
+    }
+
+    let wsc_name = &args[2];
+
+    let wsc_name_path = current_dir()
+        .unwrap()
+        .join(wsc_name)
+        .canonicalize()
+        .map_err(|err| log::error!("The input directory {wsc_name} does not exist! error: {err}"))
+        .unwrap();
+
+    if args[3] != "--output" && args[3] != "-o" {
+      log::error!("argument order is: ccfkb transform-all <yaml directory> <-o or --output> <output directory name>");
+      exit(1);
+    }
+
+    let out_dir = &args[4];
+
+    let out_dir_path = current_dir().unwrap().join(out_dir);
+    create_dir_all(&out_dir_path).unwrap();
+
+    let files = walkdir::WalkDir::new(&wsc_name_path)
+        .into_iter()
+        .filter_map(|it| it.ok())
+        .map(|it| it.into_path())
+        .collect::<Vec<_>>();
+    for file in files {
+      if !file.extension().unwrap().to_string_lossy().ends_with("yaml") {
+        continue;
+      }
+
+      transform_wsc_file_command(&file, &out_dir_path);
+
+    }
+
   }
 }
 
-fn get_final_file_list<T>(input_files: Vec<T>, recurse_dirs: bool, action: &str) -> Vec<PathBuf>
-where
-  T: AsRef<Path> + Sync + Send,
-{
-  let filter_func = |it: &PathBuf| {
-    let value = it.extension().unwrap_or_default();
-    if it.file_stem().unwrap_or_default() == "directory" {
-      return false;
-    }
-    if action == "decode" {
-      value == "opcodescript" || value == "yaml"
-    } else if action == "transform" {
-      value == "yaml"
-    } else {
-      true
-    }
-  };
+fn decode_wsc_file_command(wsc_name_path: &Path, out_dir_path: &Path) {
+  log::info!("Decoding file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
+  let input = std::fs::read(wsc_name_path).unwrap();
 
-  use rayon::prelude::*;
-  let output = if !recurse_dirs {
-    input_files
-      .par_iter()
-      .map(|it| it.as_ref().to_path_buf())
-      .filter(filter_func)
-      .collect()
-  } else {
-    input_files
-      .par_iter()
-      .flat_map(|file| {
-        WalkDir::new(file.as_ref())
-          .contents_first(true)
-          .into_iter()
-          .filter_map(Result::ok)
-          .filter(|it| it.path().is_file())
-          .map(|it| it.into_path())
-          .filter(filter_func)
-          .collect::<Vec<_>>()
-      })
-      .collect()
-  };
+  let out = decode_wsc(&input);
+
+  let res = serde_yml::to_string(&out)
+      .unwrap()
+      .replace("'[", "[")
+      .replace("]'", "]")
+      .replace(r#"'""#, "")
+      .replace(r#""'"#, "");
+
+  let output_file = out_dir_path.join(wsc_name_path.file_name().unwrap()).with_extension("WSC.yaml");
+  std::fs::write(output_file, res).unwrap();
+}
+
+
+fn transform_wsc_file_command(wsc_name_path: &Path, out_dir_path: &Path) {
+  log::info!("Transforming file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
+  let input = std::fs::read_to_string(wsc_name_path).unwrap();
   
-  output
+  let script = serde_yml::from_str(&input).unwrap();
+  
+  let out = tl_transform_script(&script);
+  
+  let out_path = out_dir_path.join(wsc_name_path
+      .file_name()
+      .unwrap()
+      .to_string_lossy()
+      .replace("yaml", "txt")
+  );
+  std::fs::write(out_path, out).unwrap();
 }
