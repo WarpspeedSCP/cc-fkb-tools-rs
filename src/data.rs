@@ -14,6 +14,7 @@ use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
+use itertools::Itertools;
 
 #[repr(C, packed)]
 pub struct WIPFHeader {
