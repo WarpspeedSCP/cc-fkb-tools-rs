@@ -10,7 +10,8 @@ use std::{
 };
 use util::{get_sjis_bytes, get_sjis_bytes_of_length, transmute_to_u32};
 use walkdir::WalkDir;
-use crate::data::{decode_wsc, extract_all_arcs, read_arc, tl_transform_script, write_arc};
+use crate::data::{decode_wsc, extract_all_arcs, parse_doclines, read_arc, tl_reverse_transform_script, tl_transform_script, write_arc};
+use crate::opcodes::Script;
 
 fn main() {
   env_logger::builder()
@@ -31,22 +32,25 @@ fn main() {
       exit(1);
     }
 
-    let arc_name = &args[2];
+    let arc_name = dbg!(PathBuf::from(&args[2]));
 
-    let arc_name_path = current_dir()
+    let arc_name_path = dbg!(current_dir()
       .unwrap()
       .join(arc_name)
       .canonicalize()
-      .unwrap();
+      .unwrap());
 
     if args[3] != "--output" && args[3] != "-o" {
       log::error!("argument order is: ccfkb extract <arc file> -o/--output <output folder name>");
       exit(1);
     }
 
-    let out_dir = &args[4];
+    let out_dir = PathBuf::from(&args[4]);
 
-    let out_dir_path = current_dir().unwrap().join(out_dir).canonicalize().unwrap();
+    let out_dir_path = current_dir().unwrap();
+    let out_dir_path = out_dir_path.join(out_dir);
+    create_dir_all(&out_dir_path).unwrap();
+    let out_dir_path = out_dir_path.canonicalize().unwrap();
 
     create_dir_all(&out_dir_path).unwrap();
 
@@ -177,6 +181,29 @@ fn main() {
 
     transform_wsc_file_command(&wsc_name_path, &out_dir_path.canonicalize().unwrap());
     
+  } else if args.contains(&"untransform".to_string()){
+    if args.len() < 4 {
+      log::error!(
+        "argument order is: ccfkb untransform <yaml file> <script txt file>"
+      );
+      exit(1);
+    }
+
+    let wsc_name = &args[2];
+
+    let wsc_name_path = current_dir()
+      .unwrap()
+      .join(wsc_name)
+      .canonicalize()
+      .map_err(|err| log::error!("The input file {wsc_name} does not exist! error: {err}"))
+      .unwrap();
+
+    let script_name = &args[3];
+
+    let script_name_path = current_dir().unwrap().join(script_name).canonicalize().unwrap();
+
+    untransform_wsc_file_command(&wsc_name_path, &script_name_path);
+
   } else if args.contains(&"transform-all".to_string()){
     if args.len() < 5 {
       log::error!(
@@ -254,4 +281,23 @@ fn transform_wsc_file_command(wsc_name_path: &Path, out_dir_path: &Path) {
       .replace("yaml", "txt")
   );
   std::fs::write(out_path, out).unwrap();
+}
+
+fn untransform_wsc_file_command(wsc_name_path: &Path, docline_path: &Path) {
+  log::info!("Untransforming file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
+  let script_text = std::fs::read_to_string(wsc_name_path).unwrap();
+  let mut script: Script = serde_yml::from_str(&script_text).unwrap();
+
+  let docline_text = std::fs::read_to_string(docline_path).unwrap();
+  let (_, doclines) = parse_doclines(&docline_text).unwrap();
+
+  tl_reverse_transform_script(&mut script, doclines);
+
+  let res = serde_yml::to_string(&script)
+    .unwrap()
+    .replace("'[", "[")
+    .replace("]'", "]")
+    .replace(r#"'""#, "")
+    .replace(r#""'"#, "");
+  std::fs::write(wsc_name_path, res).unwrap();
 }

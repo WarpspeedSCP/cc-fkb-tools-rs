@@ -1,12 +1,13 @@
-use crate::opcodes::{Choice, OpField, Script, TLString, make_opcode};
+use std::collections::HashMap;
+use crate::opcodes::{Choice, OpField, Script, TLString, make_opcode, Opcode};
 use crate::util::{
   encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32, unescape_str,
   unwipf,
 };
 use nom::IResult;
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_till, take_until, take_while, take_while_m_n};
-use nom::combinator::{map_res, not, opt, value};
+use nom::bytes::complete::{tag, take_until, take_while};
+use nom::combinator::{map_res, value};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{preceded, terminated};
 use nom::{AsChar, Parser};
@@ -14,7 +15,6 @@ use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
-use itertools::Itertools;
 
 #[repr(C, packed)]
 pub struct WIPFHeader {
@@ -479,10 +479,76 @@ pub fn decode_wsc(input: &[u8]) -> Script {
 const TL_CHOICE_END: Lazy<String> = Lazy::new(|| "---~~~---".to_string());
 const TL_LINE_END: Lazy<String> = Lazy::new(|| "---===---".to_string());
 
+pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
+  let mut addr2opcode: HashMap<usize, &mut Opcode> = HashMap::new();
+  for opcode in script.opcodes.iter_mut() {
+    if ![0x41, 0x42, 0x02].contains(&opcode.opcode) {
+      continue;
+    }
+
+    match opcode.opcode {
+      0x41 | 0x42 => {
+        addr2opcode.insert(opcode.address, opcode);
+      }
+      _ => {}
+    }
+  }
+
+  for line in tl_doc.into_iter() {
+    match line {
+      DocLine::Line(line) => {
+        let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
+
+        if opcode.opcode == 0x41 {
+          match opcode.fields.get_mut(3) {
+            Some(OpField::String(orig_str)) => {
+              let _ = std::mem::replace(orig_str, line.translation);
+            }
+            _ => {}
+          };
+        }
+      }
+      DocLine::SpeakerLine(line) => {
+        let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
+        if opcode.opcode == 0x42 {
+          match opcode.fields.get_mut(4) {
+            Some(OpField::String(orig_str)) => {
+              let _ = std::mem::replace(orig_str, line.speaker_translation);
+            }
+            _ => {}
+          };
+
+          match opcode.fields.get_mut(5) {
+            Some(OpField::String(orig_str)) => {
+              let _ = std::mem::replace(orig_str, line.translation);
+            }
+            _ => {}
+          };
+        }
+      }
+      DocLine::Choices(choice) => {
+        let opcode = addr2opcode.get_mut(&(choice.address as usize)).unwrap();
+        if opcode.opcode == 0x02 {
+          match opcode.fields.get_mut(2) {
+            Some(OpField::Choice(orig_choices)) => {
+              orig_choices
+                .into_iter()
+                .zip(choice.choices.into_iter())
+                .for_each(|(orig, new)| {
+                  let _ = std::mem::replace(&mut orig.choice_str, new);
+              });
+            }
+            _ => {}
+          };
+        }
+      }
+    }
+  }
+}
+
 pub fn tl_transform_script(input: &Script) -> String {
   let mut lines = vec![];
 
-  let mut curr_speaker = ("", String::default(), &0);
   for opcode in input.opcodes.iter() {
     if ![0x41, 0x42, 0x02].contains(&opcode.opcode) {
       continue;
@@ -507,8 +573,6 @@ pub fn tl_transform_script(input: &Script) -> String {
         });
 
         lines.push(docline.to_string());
-
-        
       }
       // Textbox with no speaker.
       0x41 => {
@@ -551,10 +615,10 @@ pub fn tl_transform_script(input: &Script) -> String {
       _ => continue,
     }
     lines.push(TL_LINE_END.clone());
-    lines.push("\n".to_string());
+    lines.push("\n\n\n".to_string());
   }
 
-  lines.join("\n")
+  lines.join("")
 }
 
 fn is_hex_digit_a(c: char) -> bool {
@@ -633,15 +697,12 @@ impl std::fmt::Display for DocLine {
             notes: note_text,
           },
       }) => {
-        write!(
-          f,
-          r#"[original text @ 0x{address:08X}]: {raw}
-[translation]: {}
-[notes]: {}
-"#,
-          tl_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default(),
-          note_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default()
-        )
+        let translation = tl_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default();
+        let notes = note_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default();
+
+        write!(f, "[original text @ 0x{address:08X}]: {raw}\n")?;
+        write!(f, "[translation]: {translation}\n")?;
+        write!(f, "[notes]: {notes}\n")
       }
       DocLine::SpeakerLine(SpeakerLine {
         speaker_translation:
@@ -659,21 +720,17 @@ impl std::fmt::Display for DocLine {
             notes: note_text,
           },
       }) => {
-        write!(
-          f,
-          r#"[speaker @ 0x{address:08X}]: {} ({})
-[original text @ 0x{speaker_address:08X}]: {raw}
-[translation]: {}
-[notes]: {}
-"#,
-          speaker_translation
-            .as_ref()
-            .map(|it| it.as_str())
-            .unwrap_or_default(),
-          speaker_raw.trim(),
-          tl_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default(),
-          note_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default()
-        )
+        let speaker_tl_text = speaker_translation
+          .as_ref()
+          .map(|it| it.as_str())
+          .unwrap_or_default();
+        let translation = tl_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default();
+        let notes = note_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default();
+
+        write!(f, "[speaker @ 0x{address:08X}]: {speaker_tl_text} ({speaker_raw})\n")?;
+        write!(f, "[original text @ 0x{speaker_address:08X}]: {raw}\n")?;
+        write!(f, "[translation]: {translation}\n")?;
+        write!(f, "[notes]: {notes}\n")
       }
       DocLine::Choices(ChoiceLine { address, choices }) => {
         write!(f, "[choices @ 0x{address:08X}]\n")?;
@@ -695,12 +752,11 @@ impl std::fmt::Display for DocLine {
           write!(f, "[choice original text]: {raw}\n")?;
           write!(f, "[choice translation]: {tl_text}\n")?;
           write!(f, "[choice notes]: {note_text}\n")?;
-          write!(f, "{}\n", TL_CHOICE_END.clone())?;
+          write!(f, "{}\n\n", TL_CHOICE_END.clone())?;
         }
         Ok(())
       }
-    }?;
-    write!(f, "{}\n\n", TL_LINE_END.as_str())
+    }
   }
 }
 
