@@ -194,9 +194,7 @@ pub fn write_arc(input_folder: &Path) -> Vec<u8> {
     let mut contents = std::fs::read(&curr_path).unwrap();
 
     if filename.ends_with("WSC") {
-      contents
-        .iter_mut()
-        .for_each(|chr| *chr = chr.rotate_left(2));
+      rotate_wsc_for_pack(&mut contents)
     }
 
     output.extend(&(contents.len() as u32).to_le_bytes());
@@ -235,13 +233,6 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
       offset: start_offset,
     });
   }
-
-  let ext_descriptors_out_file = out_folder.join("extensions.json");
-  std::fs::write(
-    &ext_descriptors_out_file,
-    serde_yml::to_string(&ext_descriptors).unwrap(),
-  )
-  .unwrap();
 
   log::info!(
     "There are {} files to process.",
@@ -293,145 +284,155 @@ pub fn read_arc(input: &mut [u8], out_folder: PathBuf, extract_wipf: bool) -> ()
     let content = &mut input[desc.offset..(desc.offset + desc.size)];
 
     if filename.ends_with("WSC") {
-      content
-        .iter_mut()
-        .for_each(|chr| *chr = chr.rotate_right(2));
+      rotate_wsc_for_unpack(content);
     } else if &content[..4] == "WIPF".as_bytes() && extract_wipf {
-      let header = WIPFHeader::from_ref(content);
-      let entries =
-        WIPFENTRY::from_ref_as_slice(&content[size_of_val(header)..], header.n_entries as usize);
+      do_extract_wipf(&filename, &output_file_path, content);
+      continue;
+    }
 
-      log::warn!(
+    std::fs::write(output_file_path, content).unwrap();
+  }
+}
+
+fn rotate_wsc_for_unpack(input: &mut [u8]) {
+  input.iter_mut().for_each(|chr| *chr = chr.rotate_right(2));
+}
+
+fn rotate_wsc_for_pack(input: &mut [u8]) {
+  input.iter_mut().for_each(|chr| *chr = chr.rotate_left(2));
+}
+
+fn do_extract_wipf(filename: &str, output_file_path: &Path, content: &mut [u8]) {
+  let header = WIPFHeader::from_ref(content);
+  let entries =
+    WIPFENTRY::from_ref_as_slice(&content[size_of_val(header)..], header.n_entries as usize);
+
+  log::warn!(
         "WIPF file {filename} has {} entries with depth {}.",
         entries.len(),
         u32::from(header.depth)
       );
 
-      let data = &content[size_of_val(header) + size_of_val(entries)..];
-      let mut data_ptr = 0usize;
-      for (entry_no, entry) in entries.iter().enumerate() {
-        log::warn!(
+  let data = &content[size_of_val(header) + size_of_val(entries)..];
+  let mut data_ptr = 0usize;
+  for (entry_no, entry) in entries.iter().enumerate() {
+    log::warn!(
           "    entry is {}x{}",
           u32::from(entry.width),
           u32::from(entry.height)
         );
 
-        let palette = if header.depth == 8 {
-          let palette = &data[data_ptr..data_ptr + 1024];
-          data_ptr += 1024;
-          palette
-        } else {
-          &[]
-        };
+    let palette = if header.depth == 8 {
+      let palette = &data[data_ptr..data_ptr + 1024];
+      data_ptr += 1024;
+      palette
+    } else {
+      &[]
+    };
 
-        let out_depth = header.depth as u32 / 8;
-        let out_stride = (entry.width * out_depth + 3) & !3u32;
-        let out_len = (entry.height * out_stride) as usize;
+    let out_depth = header.depth as u32 / 8;
+    let out_stride = (entry.width * out_depth + 3) & !3u32;
+    let out_len = (entry.height * out_stride) as usize;
 
-        let out_buf = unwipf(&data[data_ptr..(data_ptr + entry.length as usize)], out_len);
+    let out_buf = unwipf(&data[data_ptr..(data_ptr + entry.length as usize)], out_len);
 
-        data_ptr += entry.length as usize;
+    data_ptr += entry.length as usize;
 
-        let out_file = output_file_path.join(&format!(
-          "{filename}_{entry_no:03}+{}x{}y.bmp",
-          u32::from(entry.x_offset),
-          u32::from(entry.y_offset)
-        ));
+    let out_file = output_file_path.join(&format!(
+      "{filename}_{entry_no:03}+{}x{}y.bmp",
+      u32::from(entry.x_offset),
+      u32::from(entry.y_offset)
+    ));
 
-        let mut out_buf = if header.depth == 24 {
-          let mut new_out = vec![0u8; out_buf.len()];
+    let mut out_buf = if header.depth == 24 {
+      let mut new_out = vec![0u8; out_buf.len()];
 
-          let clr_stride = entry.width as usize;
-          let clr_len = entry.height as usize * clr_stride;
+      let clr_stride = entry.width as usize;
+      let clr_len = entry.height as usize * clr_stride;
 
-          for y in 0..(entry.height as usize) {
-            let curr_line_offset = (y * clr_stride);
+      for y in 0..(entry.height as usize) {
+        let curr_line_offset = (y * clr_stride);
 
-            fn mkrange(start: usize, len: usize) -> std::ops::Range<usize> {
-              start..(start + len)
-            }
-
-            let out_rgb_line = &mut new_out[curr_line_offset..(curr_line_offset + clr_stride)];
-
-            let r_range = mkrange(curr_line_offset, clr_stride);
-            let g_range = mkrange(curr_line_offset + clr_len, clr_stride);
-            let b_range = mkrange(curr_line_offset + clr_len * 2, clr_stride);
-
-            let r_line = &out_buf[r_range];
-            let g_line = &out_buf[g_range];
-            let b_line = &out_buf[b_range];
-
-            for x in 0..entry.width as usize {
-              out_rgb_line[x] = r_line[x];
-              out_rgb_line[x] = g_line[x];
-              out_rgb_line[x] = b_line[x];
-            }
-          }
-
-          new_out
-        } else {
-          out_buf
-        };
-
-        for i in 0..(entry.height / 2) as usize {
-          for j in 0..(entry.width * out_depth) as usize {
-            let a = out_buf
-              [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j];
-            let b = out_buf[i * entry.width as usize * out_depth as usize + j];
-
-            out_buf
-              [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j] = b;
-            out_buf[i * entry.width as usize * out_depth as usize + j] = a;
-          }
+        fn mkrange(start: usize, len: usize) -> std::ops::Range<usize> {
+          start..(start + len)
         }
 
-        let (file_size, bmp_offset, imgdata_size) = if header.depth == 8 {
-          (0x436 + out_buf.len(), 0x436, 0x400 + out_buf.len())
-        } else {
-          (0x36 + out_buf.len(), 0x36, out_buf.len())
-        };
+        let out_rgb_line = &mut new_out[curr_line_offset..(curr_line_offset + clr_stride)];
 
-        let bmp_header = BMPHeader {
-          magic: ['B' as u8, 'M' as u8],
-          filesz: file_size as u32,
-          res1: 0,
-          res2: 0,
-          offset: bmp_offset,
-        };
+        let r_range = mkrange(curr_line_offset, clr_stride);
+        let g_range = mkrange(curr_line_offset + clr_len, clr_stride);
+        let b_range = mkrange(curr_line_offset + clr_len * 2, clr_stride);
 
-        let bmp_dib_header = BMPDibV3Header {
-          header_sz: 0x28,
-          width: entry.width,
-          height: entry.height,
-          nplanes: 1,
-          bmp_bytesz: imgdata_size as u32,
-          depth: header.depth,
-          compress_type: 0,
-          hres: 0,
-          vres: 0,
-          ncolors: 0,
-          nimpcolors: 0,
-        };
+        let r_line = &out_buf[r_range];
+        let g_line = &out_buf[g_range];
+        let b_line = &out_buf[b_range];
 
-        std::fs::create_dir_all(&output_file_path).unwrap();
-        let hdr_bytes = to_bytes(&bmp_header);
-        let dib_bytes = to_bytes(&bmp_dib_header);
-        std::fs::write(
-          out_file,
-          hdr_bytes
-            .iter()
-            .chain(dib_bytes)
-            .chain(if header.depth == 8 { palette } else { &[] })
-            .chain(out_buf.iter())
-            .copied()
-            .collect::<Vec<u8>>(),
-        )
-        .unwrap();
+        for x in 0..entry.width as usize {
+          out_rgb_line[x] = r_line[x];
+          out_rgb_line[x] = g_line[x];
+          out_rgb_line[x] = b_line[x];
+        }
       }
-      continue;
+
+      new_out
+    } else {
+      out_buf
+    };
+
+    for i in 0..(entry.height / 2) as usize {
+      for j in 0..(entry.width * out_depth) as usize {
+        let a = out_buf
+          [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j];
+        let b = out_buf[i * entry.width as usize * out_depth as usize + j];
+
+        out_buf
+          [(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j] = b;
+        out_buf[i * entry.width as usize * out_depth as usize + j] = a;
+      }
     }
 
-    std::fs::write(output_file_path, content).unwrap();
+    let (file_size, bmp_offset, imgdata_size) = if header.depth == 8 {
+      (0x436 + out_buf.len(), 0x436, 0x400 + out_buf.len())
+    } else {
+      (0x36 + out_buf.len(), 0x36, out_buf.len())
+    };
+
+    let bmp_header = BMPHeader {
+      magic: ['B' as u8, 'M' as u8],
+      filesz: file_size as u32,
+      res1: 0,
+      res2: 0,
+      offset: bmp_offset,
+    };
+
+    let bmp_dib_header = BMPDibV3Header {
+      header_sz: 0x28,
+      width: entry.width,
+      height: entry.height,
+      nplanes: 1,
+      bmp_bytesz: imgdata_size as u32,
+      depth: header.depth,
+      compress_type: 0,
+      hres: 0,
+      vres: 0,
+      ncolors: 0,
+      nimpcolors: 0,
+    };
+
+    std::fs::create_dir_all(&output_file_path).unwrap();
+    let hdr_bytes = to_bytes(&bmp_header);
+    let dib_bytes = to_bytes(&bmp_dib_header);
+    std::fs::write(
+      out_file,
+      hdr_bytes
+        .iter()
+        .chain(dib_bytes)
+        .chain(if header.depth == 8 { palette } else { &[] })
+        .chain(out_buf.iter())
+        .copied()
+        .collect::<Vec<u8>>(),
+    )
+      .unwrap();
   }
 }
 
@@ -482,12 +483,12 @@ const TL_LINE_END: Lazy<String> = Lazy::new(|| "---===---".to_string());
 pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
   let mut addr2opcode: HashMap<usize, &mut Opcode> = HashMap::new();
   for opcode in script.opcodes.iter_mut() {
-    if ![0x41, 0x42, 0x02].contains(&opcode.opcode) {
+    if ![0x41, 0x42, 0xE0, 0x02].contains(&opcode.opcode) {
       continue;
     }
 
     match opcode.opcode {
-      0x41 | 0x42 => {
+      0x41 | 0x42 | 0x02 | 0xE0 => {
         addr2opcode.insert(opcode.address, opcode);
       }
       _ => {}
@@ -507,6 +508,19 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
             _ => {}
           };
         }
+      }
+      DocLine::Scene(line) => {
+        let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
+
+        if opcode.opcode == 0xE0 {
+          match opcode.fields.get_mut(0) {
+            Some(OpField::String(orig_str)) => {
+              let _ = std::mem::replace(orig_str, line.translation);
+            }
+            _ => {}
+          };
+        }
+
       }
       DocLine::SpeakerLine(line) => {
         let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
@@ -550,7 +564,7 @@ pub fn tl_transform_script(input: &Script) -> String {
   let mut lines = vec![];
 
   for opcode in input.opcodes.iter() {
-    if ![0x41, 0x42, 0x02].contains(&opcode.opcode) {
+    if ![0x41, 0x42, 0x02, 0xE0].contains(&opcode.opcode) {
       continue;
     }
 
@@ -574,6 +588,24 @@ pub fn tl_transform_script(input: &Script) -> String {
 
         lines.push(docline.to_string());
       }
+      // Textbox with no speaker.
+      0xE0 => {
+        let address = opcode.address;
+        let tl_string = match &opcode.fields[0] {
+          OpField::String(orig_str) => orig_str.clone(),
+          _ => {
+            log::error!("Weird stuff happening to scene!");
+            continue
+          }
+        };
+
+        let docline = DocLine::Scene(Line {
+          translation: tl_string,
+          address: address as u32,
+        });
+        lines.push(docline.to_string());
+      }
+
       // Textbox with no speaker.
       0x41 => {
         let address = opcode.address;
@@ -633,6 +665,7 @@ pub fn hex_int(input: &str) -> IResult<&str, u32> {
 }
 
 pub enum TLTag {
+  Scene { address: u32 },
   Speaker { address: u32 },
   Text { address: u32 },
   Choice { address: u32 },
@@ -647,11 +680,13 @@ pub fn tltag(input: &str) -> IResult<&str, TLTag> {
       ),
       terminated((value("speaker", tag("[speaker @ ")), hex_int), tag("]:")),
       terminated((value("choice", tag("[choices @ ")), hex_int), tag("]")),
+      terminated((value("scene", tag("[scene title @ ")), hex_int), tag("]")),
     )),
     |(enum_thing, address)| match enum_thing {
       "text" => Ok(TLTag::Text { address }),
       "speaker" => Ok(TLTag::Speaker { address }),
       "choice" => Ok(TLTag::Choice { address }),
+      "scene" => Ok(TLTag::Scene { address }),
       _ => Err("Bad input."),
     },
   )
@@ -683,11 +718,28 @@ pub enum DocLine {
   Line(Line),
   SpeakerLine(SpeakerLine),
   Choices(ChoiceLine),
+  Scene(Line),
 }
 
 impl std::fmt::Display for DocLine {
   fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
     match self {
+      DocLine::Scene(Line {
+                      address,
+                      translation:
+                      TLString {
+                        translation: tl_text,
+                        raw,
+                        notes: note_text,
+                      },
+                    }) => {
+        let translation = tl_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default();
+        let notes = note_text.as_ref().map(|it| it.as_str().trim()).unwrap_or_default();
+
+        write!(f, "[scene title @ 0x{address:08X}]: {raw}\n")?;
+        write!(f, "[translation]: {translation}\n")?;
+        write!(f, "[notes]: {notes}\n")
+      }
       DocLine::Line(Line {
         address,
         translation:
@@ -763,6 +815,7 @@ impl std::fmt::Display for DocLine {
 impl DocLine {
   fn line_type_string(&self) -> &str {
     match self {
+      DocLine::Scene(_) => "Scene",
       DocLine::Line(_) => "Line",
       DocLine::SpeakerLine(_) => "SpeakerLine",
       DocLine::Choices(_) => "Choices",
@@ -771,6 +824,7 @@ impl DocLine {
 
   fn address(&self) -> u32 {
     match self {
+      DocLine::Scene(Line { address, .. }) => *address,
       DocLine::Line(Line { address, .. }) => *address,
       DocLine::SpeakerLine(SpeakerLine { address, .. }) => *address,
       DocLine::Choices(ChoiceLine { address, .. }) => *address,
@@ -833,6 +887,18 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
       }
 
       (rest, DocLine::Line(textline))
+    }
+    TLTag::Scene { address } => {
+      let mut textline = Line::default();
+      textline.address = address;
+
+      let (rest, _) = take_until("\n[").parse(rest)?;
+
+      if !is_blank(header_contents) {
+        textline.translation.raw = header_contents.trim().to_string();
+      }
+
+      (rest, DocLine::Scene(textline))
     }
     TLTag::Choice { address } => {
       let mut choiceline = ChoiceLine::default();
@@ -897,6 +963,9 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
       DocLine::SpeakerLine(ref mut line) => {
         line.translation.translation = Some(tl.trim().to_string());
       }
+      DocLine::Scene(ref mut line) => {
+        line.translation.translation = Some(tl.trim().to_string());
+      }
       _ => {}
     }
   }
@@ -907,6 +976,9 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
         line.translation.notes = Some(notes.trim().to_string());
       }
       DocLine::SpeakerLine(ref mut line) => {
+        line.translation.notes = Some(notes.trim().to_string());
+      }
+      DocLine::Scene(ref mut line) => {
         line.translation.notes = Some(notes.trim().to_string());
       }
       _ => {}

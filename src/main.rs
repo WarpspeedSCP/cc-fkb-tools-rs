@@ -32,13 +32,13 @@ fn main() {
       exit(1);
     }
 
-    let arc_name = dbg!(PathBuf::from(&args[2]));
+    let arc_name = PathBuf::from(&args[2]);
 
-    let arc_name_path = dbg!(current_dir()
+    let arc_name_path = current_dir()
       .unwrap()
       .join(arc_name)
       .canonicalize()
-      .unwrap());
+      .unwrap();
 
     if args[3] != "--output" && args[3] != "-o" {
       log::error!("argument order is: ccfkb extract <arc file> -o/--output <output folder name>");
@@ -47,18 +47,15 @@ fn main() {
 
     let out_dir = PathBuf::from(&args[4]);
 
-    let out_dir_path = current_dir().unwrap();
-    let out_dir_path = out_dir_path.join(out_dir);
+    let out_dir_path = current_dir().unwrap().join(out_dir);
     create_dir_all(&out_dir_path).unwrap();
     let out_dir_path = out_dir_path.canonicalize().unwrap();
 
-    create_dir_all(&out_dir_path).unwrap();
-
     let mut file = std::fs::read(&arc_name_path).unwrap();
 
-    let path = out_dir_path.join(&arc_name_path.file_name().unwrap());
-    std::fs::create_dir_all(&path).unwrap();
-    read_arc(&mut file[..], path, false);
+    let out_arc_path = out_dir_path.join(&arc_name_path.file_name().unwrap());
+    create_dir_all(&out_arc_path).unwrap();
+    read_arc(&mut file[..], out_arc_path, false);
   } else if args.contains(&"repack".to_string()) {
     if args.len() < 5 {
       log::error!("argument order is: ccfkb repack <arc folder name> -o <output file name>");
@@ -84,6 +81,74 @@ fn main() {
 
     let data = write_arc(&arc_name_path);
     std::fs::write(output, data).unwrap();
+  } else if args.contains(&"encode".to_string()) {
+    if args.len() < 5 {
+      log::error!(
+        "argument order is: ccfkb encode <yaml file> <-o or --output> <output directory name>"
+      );
+      exit(1);
+    }
+
+    let yaml_name = &args[2];
+
+    let wsc_name_path = current_dir()
+      .unwrap()
+      .join(yaml_name)
+      .canonicalize()
+      .map_err(|err| log::error!("The input file {yaml_name} does not exist! error: {err}"))
+      .unwrap();
+
+    if args[3] != "--output" && args[3] != "-o" {
+      log::error!("argument order is: ccfkb encode <yaml file> <-o or --output> <output directory name>");
+      exit(1);
+    }
+
+    let out_dir = &args[4];
+
+    let out_dir_path = current_dir().unwrap().join(out_dir);
+    create_dir_all(&out_dir_path).unwrap();
+
+    encode_wsc_file_command(&wsc_name_path, &out_dir_path);
+  } else if args.contains(&"encode-all".to_string()) {
+    if args.len() < 5 {
+      log::error!(
+        "argument order is: ccfkb encode-all <yaml directory name> <-o or --output> <output directory name>"
+      );
+      exit(1);
+    }
+
+    let yaml_name = &args[2];
+
+    let yaml_name_path = current_dir()
+      .unwrap()
+      .join(yaml_name)
+      .canonicalize()
+      .map_err(|err| log::error!("The input directory {yaml_name} does not exist! error: {err}"))
+      .unwrap();
+
+    if args[3] != "--output" && args[3] != "-o" {
+      log::error!("argument order is: ccfkb encode-all <yaml directory name> <-o or --output> <output directory name>");
+      exit(1);
+    }
+
+    let out_dir = &args[4];
+
+    let out_dir_path = current_dir().unwrap().join(out_dir);
+    create_dir_all(&out_dir_path).unwrap();
+
+    let files = walkdir::WalkDir::new(&yaml_name_path)
+      .into_iter()
+      .filter_map(|it| it.ok())
+      .map(|it| it.into_path())
+      .collect::<Vec<_>>();
+
+    for file in files {
+      if !file.extension().unwrap().to_string_lossy().ends_with("yaml") {
+        continue;
+      }
+      encode_wsc_file_command(&file, &out_dir_path)
+    }
+
   } else if args.contains(&"decode".to_string()) {
     if args.len() < 5 {
       log::error!(
@@ -237,7 +302,8 @@ fn main() {
         .map(|it| it.into_path())
         .collect::<Vec<_>>();
     for file in files {
-      if !file.extension().unwrap().to_string_lossy().ends_with("yaml") {
+
+      if file.is_dir() || !file.extension().unwrap().to_string_lossy().ends_with("yaml") {
         continue;
       }
 
@@ -264,6 +330,18 @@ fn decode_wsc_file_command(wsc_name_path: &Path, out_dir_path: &Path) {
   let output_file = out_dir_path.join(wsc_name_path.file_name().unwrap()).with_extension("WSC.yaml");
   std::fs::write(output_file, res).unwrap();
 }
+
+fn encode_wsc_file_command(yaml_name_path: &Path, out_dir_path: &Path) {
+  log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default().to_string_lossy());
+  let input = std::fs::read_to_string(yaml_name_path).unwrap();
+
+  let script: Script = serde_yml::from_str(&input).unwrap();
+
+  let out = script.binary_serialise();
+
+  std::fs::write(out_dir_path.join(yaml_name_path.file_name().unwrap().to_string_lossy().replace(".yaml", "")), out).unwrap();
+}
+
 
 
 fn transform_wsc_file_command(wsc_name_path: &Path, out_dir_path: &Path) {

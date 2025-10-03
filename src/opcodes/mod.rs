@@ -2,108 +2,21 @@ use serde::Serializer;
 use serde_derive::{Deserialize, Serialize};
 use crate::util::{encode_sjis, get_sjis_bytes, transmute_to_u16};
 
-
-enum OpFieldType {
-    b, // u8
-    w, // u16
-    d, // u32
-    s, // String
-    c, // Choice
-    p, // 1 byte padding
-}
-
-fn define_opcode(input: &[u8], addr: usize, composition: &[OpFieldType]) -> Opcode {
-    let mut ptr = 1usize;
-    let mut fields = vec![];
-
-    for i in composition {
-        match i {
-            OpFieldType::s => {
-                let (bytes, string) = crate::util::get_sjis_bytes(ptr, input);
-                fields.push(OpField::String(TLString { 
-                    raw: string,
-                    translation: None,
-                    notes: None,
-                }));
-                ptr += bytes.len();
-            }
-            OpFieldType::b => {
-                fields.push(OpField::Byte(input[ptr]));
-                ptr += 1;
-            }
-            OpFieldType::w => {
-                fields.push(OpField::Word(crate::util::transmute_to_u16(ptr, input)));
-                ptr += 2;
-            }
-            OpFieldType::d => {
-                fields.push(OpField::DWord(crate::util::transmute_to_u32(ptr, input)));
-                ptr += 4;
-            }
-            OpFieldType::p => {
-                fields.push(OpField::Padding(1));
-                ptr += 1;
-            }
-            OpFieldType::c => {
-                let n_choices = match &fields[0] {
-                    OpField::Byte(n) => *n,
-                    _ => panic!("Weird shit!")
-                };
-                let mut choices = vec![];
-                let mut curr_ptr = ptr;
-                
-                for i in 0..n_choices {
-                    let mut new_ptr = curr_ptr;
-                    let arg1 = transmute_to_u16(new_ptr, input);
-                    new_ptr += 2;
-                    let (bytes, choice_str) = get_sjis_bytes(new_ptr, input);
-                    new_ptr += bytes.len();
-                    let arg3 = input[new_ptr];
-                    new_ptr += 1;
-                    let arg4 = transmute_to_u16(new_ptr, input);
-                    new_ptr += 2;
-                    let arg5 = input[new_ptr];
-                    new_ptr += 1;
-                    let arg6 = input[new_ptr];
-                    new_ptr += 1;
-                    let arg7 = transmute_to_u16(new_ptr, input);
-                    new_ptr += 2;
-                    let arg8 = input[new_ptr];
-                    new_ptr += 1;
-                    let arg9 = transmute_to_u16(new_ptr, input);
-                    new_ptr += 2;
-                    let choice = Choice {
-                        arg1,
-                        choice_str: TLString {
-                            raw: choice_str,
-                            translation: None,
-                            notes: None,
-                        },
-                        arg3,
-                        arg4,
-                        arg5,
-                        arg6,
-                        arg7,
-                        arg8,
-                        arg9,
-                    };
-                    choices.push(choice);
-                    curr_ptr = new_ptr + 1; // account for extra padding 0 byte.
-                }
-                ptr += choices.iter().map(|it| it.size()).sum::<usize>();
-                fields.push(OpField::Choice(choices));
-            }
-            _ => panic!()
-        }
-    }
-
-    Opcode { opcode: input[0], address: addr, actual_address: addr, fields }
-}
-
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct TLString {
     pub raw: String,
     pub translation: Option<String>,
     pub notes: Option<String>,
+}
+
+impl TLString {
+   fn bytecode_serialise(&self) -> Vec<u8> {
+       if let Some(tl) = &self.translation {
+           encode_sjis(&(tl.clone() + "%K%P"))
+       } else {
+           encode_sjis(&self.raw)
+       }
+   }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,13 +41,7 @@ impl OpField {
             OpField::Byte(_) => 1,
             OpField::Word(_) => 2,
             OpField::DWord(_) => 4,
-            OpField::String(TLString { raw, translation, .. }) => {
-                if let Some(tl) = translation {
-                    encode_sjis(&(tl.clone() + "%K%P"))
-                } else {
-                    encode_sjis(raw.as_str())
-                }.len() + 1
-            },
+            OpField::String(tlstr) => tlstr.bytecode_serialise().len() + 1,
             OpField::Choice(choices) => {
                 let mut acc = 0;
                 for choice in choices {
@@ -144,6 +51,35 @@ impl OpField {
             },
             OpField::Padding(size) => *size as usize
         }
+    }
+
+    fn bytecode_serialise(&self) -> Vec<u8> {
+        let mut buf = vec![];
+
+        match self {
+            OpField::Byte(value) => buf.push(*value),
+            OpField::Word(value) => buf.extend(value.to_le_bytes()),
+            OpField::DWord(value) => buf.extend(value.to_le_bytes()),
+            OpField::String(value) => buf.extend(value.bytecode_serialise()),
+            OpField::Choice(choices) => {
+                buf.push(choices.len() as u8);
+                buf.push(0);
+                for choice in choices {
+                    buf.extend(choice.arg1.to_le_bytes());
+                    buf.extend(choice.choice_str.bytecode_serialise());
+                    buf.extend(choice.arg3.to_le_bytes());
+                    buf.extend(choice.arg4.to_le_bytes());
+                    buf.extend(choice.arg5.to_le_bytes());
+                    buf.extend(choice.arg6.to_le_bytes());
+                    buf.extend(choice.arg7.to_le_bytes());
+                    buf.extend(choice.arg8.to_le_bytes());
+                    buf.extend(choice.arg9.to_le_bytes());
+                }
+            }
+            OpField::Padding(value) => buf.push(*value),
+        };
+
+        buf
     }
 }
 
@@ -206,6 +142,18 @@ pub struct Script {
     pub trailer: Vec<u8>,
 }
 
+impl Script {
+    pub fn binary_serialise(&self) -> Vec<u8> {
+        let mut buf = vec![];
+        for op in &self.opcodes {
+            buf.extend(op.bytecode_serialise());
+        }
+        buf.extend(&self.trailer);
+
+        buf
+    }
+}
+
 impl Opcode {
     pub(crate) fn size(&self) -> usize {
         let mut acc = 1;
@@ -213,6 +161,16 @@ impl Opcode {
             acc += i.size();
         }
         acc
+    }
+
+    pub(crate) fn bytecode_serialise(&self) -> Vec<u8> {
+        let mut buf = vec![self.opcode];
+
+        for field in &self.fields {
+            buf.extend(field.bytecode_serialise());
+        }
+
+        buf
     }
 }
 
@@ -289,7 +247,6 @@ where
 
 
 pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
-    use OpFieldType::*;
 
     let mut ptr = 1usize;
     let mut fields = vec![];
@@ -389,7 +346,6 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 
             }
         };
-        // $($arg:expr),*
         (c, $($tail:tt)*) => {
                 expand_opcode_component!(c);
 
