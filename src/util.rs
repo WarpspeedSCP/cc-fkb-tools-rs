@@ -10,8 +10,8 @@ pub fn transmute_to_u16(address: usize, input: &[u8]) -> u16 {
   u16::from_le_bytes(transmute_to_array(address, input))
 }
 
-pub fn escape_str(input: &str) -> String {
-  (input.to_string() + "%K%P")
+pub fn escape_str(input: &str, add_suffix: bool) -> String {
+  (input.to_string() + if add_suffix { "%K%P" } else { "" })
       .replace("\\", "<bslash/>")
       .replace("\"", "<dquote/>")
       .trim()
@@ -161,14 +161,8 @@ pub fn encode_sjis(unicode: &str) -> Vec<u8> {
       continue;
     }
 
-    if in_italics {
-      let mut word = vec![];
-      let output = word;
-      collector.push(output);
-    } else {
-      let output = SHIFT_JIS.encode(&substr).0.to_vec();
-      collector.push(output);
-    }
+    let output = SHIFT_JIS.encode(&substr).0.to_vec();
+    collector.push(output);
   }
 
   let output: Vec<u8> = collector.into_iter().flatten().collect();
@@ -219,7 +213,6 @@ pub fn unwipf(input: &[u8], out_len: usize) -> Vec<u8> {
   let mut buff = 0usize;
 
   // 	unsigned long  ring_len   = 4096;                        // 寻址范围就是0-4095
-  let ring_len = 4096;
   // 	unsigned char* ring       = new unsigned char[ring_len]; // 剪贴板
   let mut ring = [0u8; 4096];
   // //	unsigned long ring_index  = 0xFEE;                       // 剪贴板的索引
@@ -242,7 +235,7 @@ pub fn unwipf(input: &[u8], out_len: usize) -> Vec<u8> {
     buff += 1;
     // 		// 这个循环是判断8位的char型的每一位是否为1
     // 		for (int i = 0; i < 8 && buff < end && out_buff < out_end; i++) { // 判断条件：char型长度8循环&&不超过array的末尾
-    for i in 0..8 {
+    for _ in 0..8 {
       if buff >= end || out_buff >= out_end {
         break;
       }

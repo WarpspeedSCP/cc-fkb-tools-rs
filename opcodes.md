@@ -44,7 +44,7 @@ opcodes
     + 1 byte arg1
     + \0                                            - idk.
 0x06: 1 
-    + 2 byte offset                                 - Unconditional jump to absolute offset within current script.
+    + 4 byte offset                                 - Unconditional jump to absolute offset within current script.
 0x07: 1 
     + \0 terminated string arg1                     - Go to script named "string arg".wsc, not fully sure of the diff between 0x09.
 0x08: 2 bytes.                                      - nop

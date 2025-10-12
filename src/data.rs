@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use crate::opcodes::{Choice, OpField, Script, TLString, make_opcode, Opcode};
-use crate::util::{
-  encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32, unescape_str,
-  unwipf,
-};
+use crate::util::{encode_sjis, escape_str, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32, unescape_str, unwipf};
 use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while};
@@ -94,7 +91,7 @@ impl WIPFENTRY {
   }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExtensionDescriptor {
   name: String,
   number: u32,
@@ -159,11 +156,16 @@ pub fn write_arc(input_folder: &Path) -> Vec<u8> {
   let mut output = vec![];
 
   let extensions = std::fs::read_to_string(input_folder.join("extensions.yaml"))
+    .inspect_err(|err| log::error!("An error occurred while trying to access extensions.yaml at {}: {:#?}", input_folder.display(), err))
     .iter()
-    .flat_map(|str| serde_yml::from_str::<Vec<ExtensionDescriptor>>(&str))
+    .flat_map(|str| {
+      let res = serde_yml::from_str::<Vec<ExtensionDescriptor>>(&str);
+      res
+    })
     .next()
     .unwrap_or_default();
   let files = std::fs::read_to_string(input_folder.join("files.yaml"))
+    .inspect_err(|err| log::error!("An error occurred while trying to access files.yaml at {}: {:#?}", input_folder.display(), err))
     .iter()
     .flat_map(|str| serde_yml::from_str::<Vec<(String, FileDescriptor)>>(&str))
     .next()
@@ -351,7 +353,7 @@ fn do_extract_wipf(filename: &str, output_file_path: &Path, content: &mut [u8]) 
       let clr_len = entry.height as usize * clr_stride;
 
       for y in 0..(entry.height as usize) {
-        let curr_line_offset = (y * clr_stride);
+        let curr_line_offset = y * clr_stride;
 
         fn mkrange(start: usize, len: usize) -> std::ops::Range<usize> {
           start..(start + len)
@@ -467,7 +469,11 @@ pub fn decode_wsc(input: &[u8]) -> Script {
     }
   }
 
-  let rest = input[ptr..].to_vec();
+  let rest = if ptr >= input.len() {
+    vec![]
+  } else {
+    input[ptr..].to_vec()
+  };
 
   let out = Script {
     opcodes,
@@ -694,13 +700,13 @@ pub fn tltag(input: &str) -> IResult<&str, TLTag> {
 }
 
 #[derive(Default, Debug)]
-struct Line {
+pub struct Line {
   address: u32,
   translation: TLString,
 }
 
 #[derive(Default, Debug)]
-struct SpeakerLine {
+pub struct SpeakerLine {
   address: u32,
   speaker_address: u32,
   speaker_translation: TLString,
@@ -708,7 +714,7 @@ struct SpeakerLine {
 }
 
 #[derive(Default, Debug)]
-struct ChoiceLine {
+pub struct ChoiceLine {
   address: u32,
   choices: Vec<TLString>,
 }
@@ -923,7 +929,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
         let translation = if is_blank(choice_tl) {
           None
         } else {
-          Some(choice_tl.trim().to_string())
+          Some(escape_str(choice_tl.trim(), false))
         };
 
         let notes = if is_blank(choice_notes) {
@@ -958,13 +964,13 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
   if !is_blank(tl) {
     match docline {
       DocLine::Line(ref mut line) => {
-        line.translation.translation = Some(tl.trim().to_string());
+        line.translation.translation = Some(escape_str(tl.trim(), true));
       }
       DocLine::SpeakerLine(ref mut line) => {
-        line.translation.translation = Some(tl.trim().to_string());
+        line.translation.translation = Some(escape_str(tl.trim(), true));
       }
       DocLine::Scene(ref mut line) => {
-        line.translation.translation = Some(tl.trim().to_string());
+        line.translation.translation = Some(escape_str(tl.trim(), true));
       }
       _ => {}
     }
