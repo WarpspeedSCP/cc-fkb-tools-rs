@@ -1,6 +1,6 @@
-mod util;
-mod data;
-mod opcodes;
+pub mod util;
+pub mod data;
+pub mod opcodes;
 
 use std::{
   env::current_dir,
@@ -10,20 +10,16 @@ use std::{
 };
 use util::{get_sjis_bytes, get_sjis_bytes_of_length, transmute_to_u32};
 use walkdir::WalkDir;
-use crate::data::{decode_wsc, extract_all_arcs, parse_doclines, read_arc, tl_reverse_transform_script, tl_transform_script, write_arc};
+use ccfkb_lib::data::text_script::tl_transform_script;
+
 use crate::opcodes::Script;
 
-fn main() {
-  env_logger::builder()
-    .format_timestamp(None)
-    .format_level(true)
-    .filter_level(log::LevelFilter::Info)
-    .init();
+fn maain() {
+
 
   let args = std::env::args().collect::<Vec<_>>();
 
   if args.contains(&"extract_all".to_string()) {
-    extract_all_arcs();
   } else if args.contains(&"extract".to_string()) {
     if args.len() < 5 {
       log::error!(
@@ -32,7 +28,7 @@ fn main() {
       exit(1);
     }
 
-    let arc_name = PathBuf::from(&args[2]);
+    let arc_name = &args[2];
 
     let arc_name_path = current_dir()
       .unwrap()
@@ -45,17 +41,16 @@ fn main() {
       exit(1);
     }
 
-    let out_dir = PathBuf::from(&args[4]);
+    let out_dir = &args[4];
 
-    let out_dir_path = current_dir().unwrap().join(out_dir);
+    let out_dir_path = current_dir().unwrap().join(out_dir).canonicalize().unwrap();
+
     create_dir_all(&out_dir_path).unwrap();
-    let out_dir_path = out_dir_path.canonicalize().unwrap();
 
     let mut file = std::fs::read(&arc_name_path).unwrap();
 
-    let out_arc_path = out_dir_path.join(&arc_name_path.file_name().unwrap());
-    create_dir_all(&out_arc_path).unwrap();
-    read_arc(&mut file[..], out_arc_path, false);
+    let path = out_dir_path.join(&arc_name_path.file_name().unwrap());
+    std::fs::create_dir_all(&path).unwrap();
   } else if args.contains(&"repack".to_string()) {
     if args.len() < 5 {
       log::error!("argument order is: ccfkb repack <arc folder name> -o <output file name>");
@@ -79,8 +74,6 @@ fn main() {
 
     let output = current_dir().unwrap().join(out_file);
 
-    let data = write_arc(&arc_name_path);
-    std::fs::write(output, data).unwrap();
   } else if args.contains(&"encode".to_string()) {
     if args.len() < 5 {
       log::error!(
@@ -108,7 +101,6 @@ fn main() {
     let out_dir_path = current_dir().unwrap().join(out_dir);
     create_dir_all(&out_dir_path).unwrap();
 
-    encode_wsc_file_command(&wsc_name_path, &out_dir_path);
   } else if args.contains(&"encode-all".to_string()) {
     if args.len() < 5 {
       log::error!(
@@ -146,7 +138,6 @@ fn main() {
       if !file.extension().unwrap().to_string_lossy().ends_with("yaml") {
         continue;
       }
-      encode_wsc_file_command(&file, &out_dir_path)
     }
 
   } else if args.contains(&"decode".to_string()) {
@@ -176,7 +167,6 @@ fn main() {
     let out_dir_path = current_dir().unwrap().join(out_dir);
     create_dir_all(&out_dir_path).unwrap();
 
-    decode_wsc_file_command(&wsc_name_path, &out_dir_path);
   } else if args.contains(&"decode-all".to_string()) {
     if args.len() < 5 {
       log::error!(
@@ -214,7 +204,6 @@ fn main() {
         continue;
       }
       
-      decode_wsc_file_command(&file, &out_dir_path)
 
     }
   } else if args.contains(&"transform".to_string()){
@@ -244,8 +233,7 @@ fn main() {
     let out_dir_path = current_dir().unwrap().join(out_dir);
     create_dir_all(&out_dir_path).unwrap();
 
-    transform_wsc_file_command(&wsc_name_path, &out_dir_path.canonicalize().unwrap());
-    
+
   } else if args.contains(&"untransform".to_string()){
     if args.len() < 4 {
       log::error!(
@@ -267,7 +255,6 @@ fn main() {
 
     let script_name_path = current_dir().unwrap().join(script_name).canonicalize().unwrap();
 
-    untransform_wsc_file_command(&wsc_name_path, &script_name_path);
 
   } else if args.contains(&"transform-all".to_string()){
     if args.len() < 5 {
@@ -302,80 +289,12 @@ fn main() {
         .map(|it| it.into_path())
         .collect::<Vec<_>>();
     for file in files {
-
-      if file.is_dir() || !file.extension().unwrap().to_string_lossy().ends_with("yaml") {
+      if !file.extension().unwrap().to_string_lossy().ends_with("yaml") {
         continue;
       }
 
-      transform_wsc_file_command(&file, &out_dir_path);
 
     }
 
   }
-}
-
-fn decode_wsc_file_command(wsc_name_path: &Path, out_dir_path: &Path) {
-  log::info!("Decoding file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
-  let input = std::fs::read(wsc_name_path).unwrap();
-
-  let out = decode_wsc(&input);
-
-  let res = serde_yml::to_string(&out)
-      .unwrap()
-      .replace("'[", "[")
-      .replace("]'", "]")
-      .replace(r#"'""#, "")
-      .replace(r#""'"#, "");
-
-  let output_file = out_dir_path.join(wsc_name_path.file_name().unwrap()).with_extension("WSC.yaml");
-  std::fs::write(output_file, res).unwrap();
-}
-
-fn encode_wsc_file_command(yaml_name_path: &Path, out_dir_path: &Path) {
-  log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default().to_string_lossy());
-  let input = std::fs::read_to_string(yaml_name_path).unwrap();
-
-  let script: Script = serde_yml::from_str(&input).unwrap();
-
-  let out = script.binary_serialise();
-
-  std::fs::write(out_dir_path.join(yaml_name_path.file_name().unwrap().to_string_lossy().replace(".yaml", "")), out).unwrap();
-}
-
-
-
-fn transform_wsc_file_command(wsc_name_path: &Path, out_dir_path: &Path) {
-  log::info!("Transforming file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
-  let input = std::fs::read_to_string(wsc_name_path).unwrap();
-  
-  let script = serde_yml::from_str(&input).unwrap();
-  
-  let out = tl_transform_script(&script);
-  
-  let out_path = out_dir_path.join(wsc_name_path
-      .file_name()
-      .unwrap()
-      .to_string_lossy()
-      .replace("yaml", "txt")
-  );
-  std::fs::write(out_path, out).unwrap();
-}
-
-fn untransform_wsc_file_command(wsc_name_path: &Path, docline_path: &Path) {
-  log::info!("Untransforming file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
-  let script_text = std::fs::read_to_string(wsc_name_path).unwrap();
-  let mut script: Script = serde_yml::from_str(&script_text).unwrap();
-
-  let docline_text = std::fs::read_to_string(docline_path).unwrap();
-  let (_, doclines) = parse_doclines(&docline_text).unwrap();
-
-  tl_reverse_transform_script(&mut script, doclines);
-
-  let res = serde_yml::to_string(&script)
-    .unwrap()
-    .replace("'[", "[")
-    .replace("]'", "]")
-    .replace(r#"'""#, "")
-    .replace(r#""'"#, "");
-  std::fs::write(wsc_name_path, res).unwrap();
 }

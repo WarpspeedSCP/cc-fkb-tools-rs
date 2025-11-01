@@ -1,0 +1,9 @@
+[package]
+name = "ccfkb_compress"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11.8"
+ccfkb_lib = { path = "../ccfkb_lib" }
+serde_yml = "0.0.12"

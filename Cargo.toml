@@ -1,17 +1,13 @@
-[package]
-name = "ccfkb_pack"
-version = "0.1.0"
-edition = "2024"
+[workspace]
 
-[dependencies]
-encoding_rs = "0.8.35"
-env_logger = "0.11.8"
-once_cell = "1.21.3"
-log = "0.4.22"
-walkdir = "2.5.0"
-serde = "1.0.219"
-serde_derive = "1.0.219"
-rayon = "1.10.0"
-serde_yml = "0.0.12"
-nom = "8.0.0"
-itertools = "0.14.0"
+members = [
+    "ccfkb_pack",
+    "ccfkb_unpack",
+    "ccfkb_extract",
+    "ccfkb_compress",
+    "ccfkb_encode",
+    "ccfkb_decode",
+    "ccfkb_transform",
+    "ccfkb_untransform",
+    "ccfkb_lib"
+]
