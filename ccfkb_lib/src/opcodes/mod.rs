@@ -233,7 +233,7 @@ fn adjust_single_opcode(
       let offset = target_address - (curr_actual_address + 11);
       opcode.fields[3] = OpField::DWord(offset as u32);
       log::debug!(
-        "Adjusting conditional jump Opcode ({:02X}) at 0x{:08X} (actual 0x{:08X}) to jump to offset: 0x{:04X} (0x{:08X})",
+        "Adjusting conditional jump Opcode ({:02X}) at 0x{:08X} (actual 0x{:08X}) originally targetting {target_orig_address:08X} to jump to offset: 0x{:04X} (0x{:08X})",
         opcode.opcode,
         opcode.address,
         opcode.actual_address,

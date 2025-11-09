@@ -1,27 +1,26 @@
 use std::env::current_dir;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use ccfkb_lib::data::text_script::tl_transform_script;
-use ccfkb_lib::{log, main};
-use ccfkb_lib::opcodes::Script;
+use ccfkb_lib::{log, main_preamble};
 
-main!(files, "WSC.yaml", {
-    let files: Vec<_> = files.collect();
+fn main() {
+    let files: Vec<_> = main_preamble!(&"WSC.yaml").collect();
     
     if files.len() == 1 {
         let in_file = files.first().unwrap();
-        let out_file = current_dir().unwrap().join(in_file.with_extension("WSC.txt"));
+        let out_file = current_dir().unwrap().join(in_file.with_extension("txt"));
         transform_wsc_file_command(&in_file, &out_file);
     }
     else {
         let out_parent_path = files.first().unwrap().parent().unwrap().file_name().unwrap();
-        let out_path = current_dir().unwrap().join(out_parent_path).with_extension("ARC.script");
+        let out_path = current_dir().unwrap().join(out_parent_path).with_extension("script");
         for i in files {
             let dirent = i;
-            let out_file = out_path.join(dirent.with_extension("WSC.txt"));
+            let out_file = out_path.join(dirent.with_extension("txt"));
             transform_wsc_file_command(&dirent, &out_file);
         }
     }
-});
+}
 
 fn transform_wsc_file_command(wsc_name_path: &Path, out_file: &Path) {
     

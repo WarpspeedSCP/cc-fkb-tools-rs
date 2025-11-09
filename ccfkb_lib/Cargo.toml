@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
+name = "ccfkb_lib"
 
 [dependencies]
 walkdir = "2.5.0"

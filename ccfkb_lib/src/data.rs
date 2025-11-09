@@ -1,11 +1,10 @@
 use crate::opcodes::{Script, make_opcode};
 use crate::util::{
-  encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32, unescape_str,
+  encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32,
   unwipf,
 };
 use serde_derive::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use itertools::Itertools;
+use std::path::Path;
 
 pub mod text_script;
 
@@ -171,7 +170,7 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Path, extract_wipf: bool) 
   let mut curr_offset = first_offset;
   let (_, mut input) = input.split_at_mut(first_offset);
   for (filename, desc) in filenames.iter().zip(&files) {
-    log::info!("Processing {filename}.");
+    log::info!("Processing {filename}");
 
     let output_file_path = out_folder.join(filename.as_str());
     if curr_offset < desc.offset {
@@ -197,7 +196,7 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Path, extract_wipf: bool) 
   (ext_descriptors, files, filenames, contents)
 }
 
-pub fn write_arc<T: AsRef<Path>>(input_files: &Vec<T>, extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> Vec<u8> {
+pub fn write_arc<T: AsRef<Path>>(input_files: &[T], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> Vec<u8> {
   let mut output = vec![];
 
   output.extend((extensions.len() as u32).to_le_bytes());
@@ -213,6 +212,8 @@ pub fn write_arc<T: AsRef<Path>>(input_files: &Vec<T>, extensions: Vec<Extension
   let mut curr_offset = output.len() + (13 + 4 + 4) * files.len(); // the size of a file descriptor.
 
   for (descriptor, curr_path) in files.iter().zip(input_files.iter().map(AsRef::as_ref)) {
+    log::info!("Packing {}", curr_path.display());
+
     let mut sjis_name = encode_sjis(&descriptor.name);
     let sjis_name = if sjis_name.len() < 13 {
       sjis_name.extend(vec![0u8; 13 - sjis_name.len()]);
@@ -220,6 +221,7 @@ pub fn write_arc<T: AsRef<Path>>(input_files: &Vec<T>, extensions: Vec<Extension
     } else {
       sjis_name
     };
+
     output.extend(sjis_name);
     let mut contents = std::fs::read(&curr_path).unwrap();
 

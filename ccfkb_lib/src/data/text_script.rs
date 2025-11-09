@@ -3,8 +3,8 @@ use crate::opcodes::{Choice, OpField, Opcode, Script, TLString};
 
 use nom::IResult;
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_till, take_until, take_while, take_while_m_n};
-use nom::combinator::{map_res, not, opt, value};
+use nom::bytes::complete::{tag, take_until, take_while};
+use nom::combinator::{map_res, opt, value};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{preceded, terminated};
 use nom::{AsChar, Parser};
@@ -124,7 +124,7 @@ pub fn tl_transform_script(input: &Script) -> String {
 
         lines.push(docline.to_string());
       }
-      // Textbox with no speaker.
+      // Scene title.
       0xE0 => {
         let address = opcode.address;
         let tl_string = match &opcode.fields[0] {
@@ -216,7 +216,7 @@ pub fn tltag(input: &str) -> IResult<&str, TLTag> {
       ),
       terminated((value("speaker", tag("[speaker @ ")), hex_int), tag("]:")),
       terminated((value("choice", tag("[choices @ ")), hex_int), tag("]")),
-      terminated((value("scene", tag("[scene title @ ")), hex_int), tag("]")),
+      terminated((value("scene", tag("[scene title @ ")), hex_int), tag("]:")),
     )),
     |(enum_thing, address)| match enum_thing {
       "text" => Ok(TLTag::Text { address }),
@@ -443,19 +443,13 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
       let (rest, stuff) = many0(terminated(
         (
           preceded(tag("\n[choice original text]:"), take_until("\n[")),
-          (
-            preceded(tag("\n[choice translation]:"), take_until("\n[")),
-            preceded(
-              tag("\n[choice notes]:"),
-              terminated(take_until("\n---"), take_until(TL_CHOICE_END.as_str())),
-            ),
-          ),
+          preceded(tag("\n[choice translation]:"), take_until("\n[")),
+          preceded(tag("\n[choice notes]:"), take_until(TL_CHOICE_END.as_str())),
         ),
-        tag(TL_CHOICE_END.as_str()),
-      ))
-          .parse(rest)?;
+        (tag(TL_CHOICE_END.as_str()), alt((take_until("\n["), take_until(TL_LINE_END.as_str())))),
+      )).parse(rest)?;
 
-      for (raw, (choice_tl, choice_notes)) in stuff {
+      for (raw, choice_tl, choice_notes) in stuff {
         let translation = if is_blank(choice_tl) {
           None
         } else {
@@ -475,7 +469,8 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
         });
       }
 
-      (rest, DocLine::Choices(choiceline))
+      let (rest, _) = tag(TL_LINE_END.as_str()).parse(rest)?;
+      return Ok((rest, DocLine::Choices(choiceline)))
     }
   };
 
@@ -500,7 +495,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
         line.translation.translation = Some(escape_str(tl.trim(), true));
       }
       DocLine::Scene(ref mut line) => {
-        line.translation.translation = Some(escape_str(tl.trim(), true));
+        line.translation.translation = Some(escape_str(tl.trim(), false));
       }
       _ => {}
     }

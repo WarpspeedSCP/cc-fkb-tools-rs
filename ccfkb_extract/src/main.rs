@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use ccfkb_lib::data::read_arc;
-use ccfkb_lib::main;
+use ccfkb_lib::main_preamble;
 
-main!(files, "arc", {
+fn main() {
+    let files = main_preamble!(&"ARC");
+    
     std::fs::create_dir_all("extracted_arcs").unwrap();
     
     for i in files {
@@ -26,5 +28,5 @@ main!(files, "arc", {
             std::fs::write(out_path, content).unwrap();
         }
     }
-});
+}
 

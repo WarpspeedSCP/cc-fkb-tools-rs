@@ -10,6 +10,20 @@ pub fn transmute_to_u16(address: usize, input: &[u8]) -> u16 {
   u16::from_le_bytes(transmute_to_array(address, input))
 }
 
+pub fn safe_create_dir(dir: &std::path::Path) -> std::io::Result<()> {
+  std::fs::create_dir(dir).or_else(|it| {
+    if it.kind() == std::io::ErrorKind::AlreadyExists {
+      Ok(())
+    } else {
+      Err(it)
+    }
+  })
+}
+
+pub fn ends_with_ignore_case(a: &dyn AsRef<str>, b: &dyn AsRef<str>) -> bool {
+  a.as_ref().ends_with(b.as_ref()) || a.as_ref().to_ascii_uppercase().ends_with(&b.as_ref().to_ascii_uppercase())
+}
+
 pub fn escape_str(input: &str, add_suffix: bool) -> String {
   (input.to_string() + if add_suffix { "%K%P" } else { "" })
       .replace("\\", "<bslash/>")

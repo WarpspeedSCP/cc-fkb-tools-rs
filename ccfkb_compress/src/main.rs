@@ -1,9 +1,10 @@
 use std::env::current_dir;
 use ccfkb_lib::data::{write_arc, ExtensionDescriptor, FileDescriptor};
-use ccfkb_lib::main;
+use ccfkb_lib::main_preamble;
 
-main!(files, "", {
-    let files = files.collect::<Vec<_>>();
+fn main() {
+    let files = main_preamble!(&"").collect::<Vec<_>>();
+    
     let output_file_name = files.first().unwrap().parent().unwrap().file_name().unwrap().to_str().unwrap();
     let extensions_yaml_file = files.iter().find(|it| it.ends_with("extensions.yaml") || it.ends_with("extensions.yml")).unwrap();
     let files_yaml_file = files.iter().find(|it| it.ends_with("files.yaml") || it.ends_with("files.yml")).unwrap();
@@ -23,4 +24,4 @@ main!(files, "", {
 
     let output = write_arc(&files, ext_descriptors, file_descriptors);
     std::fs::write(current_dir().unwrap().join(output_file_name), output).unwrap();
-});
+}

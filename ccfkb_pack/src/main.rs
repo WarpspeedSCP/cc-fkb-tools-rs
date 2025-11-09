@@ -1,53 +1,73 @@
 use std::path::{Path, PathBuf};
-use ccfkb_lib::data::{decode_wsc, fix_yaml_str, read_arc};
-use ccfkb_lib::{log, main};
-use ccfkb_lib::data::text_script::tl_transform_script;
+use ccfkb_lib::data::{write_arc, ExtensionDescriptor, FileDescriptor};
+use ccfkb_lib::{log, main_preamble};
 
-main!(files, ".WSC.txt", {
-    let files: Vec<_> = files.collect();
-    let yaml_folder = files.first().unwrap().parent().unwrap().with_extension("ARC.yaml");
+use ccfkb_lib::data::text_script::{parse_doclines, tl_reverse_transform_script};
+use ccfkb_lib::opcodes::Script;
 
+fn encode_wsc_file_command(yaml_name_path: &Path, script: Script) -> Vec<u8> {
+    log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default().to_string_lossy());
+    let out = script.binary_serialise();
+    out
+}
 
+fn untransform_wsc_file_command(yaml_file: &Path, yaml_text: &str, text: &str) -> Script {
+    log::info!("Untransforming file {}", &yaml_file.file_name().unwrap_or_default().to_string_lossy());
+    let mut script: Script = serde_yml::from_str(&yaml_text).unwrap();
+    let (_, doclines) = parse_doclines(&text).unwrap();
 
-    // for i in files {
-    //     let dirent = i;
-    //     let mut file_contents = std::fs::read(&dirent).unwrap();
-    //
-    //     let path = PathBuf::from("extracted_arcs").join(dirent.file_name().unwrap());
-    //     std::fs::create_dir_all(&path).unwrap();
-    //     let (exts, files, filenames, data) = read_arc(&mut file_contents[..], &path, false);
-    //
-    //     let exts_yml_path = path.join("extensions.yaml");
-    //     let exts_yml = serde_yml::to_string(&exts).unwrap();
-    //     std::fs::write(&exts_yml_path, &exts_yml).unwrap();
-    //
-    //     let files_yml_path = path.join("files.yaml");
-    //     let files_yml = serde_yml::to_string(&files).unwrap();
-    //     std::fs::write(&files_yml_path, &files_yml).unwrap();
-    //
-    //     let output_file_paths: Vec<_> = filenames
-    //         .iter()
-    //         .zip(&data)
-    //         .map(|(filename, content)| {
-    //             let out_path = path.join(filename);
-    //             std::fs::write(&out_path, content).unwrap();
-    //             out_path
-    //         })
-    //         .collect();
-    //
-    //     let path = path.with_extension("ARC.yaml");
-    //     let output_file_paths: Vec<_> = output_file_paths.iter().map(|file| {
-    //         let out_path = path.join(file.file_name().unwrap()).with_extension("WSC.yaml");
-    //         let res = decode_wsc_file_command(&file);
-    //         std::fs::write(&out_path, res).unwrap();
-    //
-    //         out_path
-    //     }).collect();
-    //
-    //     let path = path.with_extension("ARC.script");
-    //     output_file_paths.iter().for_each(|file| {
-    //         let out_path = path.join(file.file_name().unwrap()).with_extension("WSC.txt");
-    //         transform_wsc_file_command(&dirent, &out_path);
-    //     });
-    // }
-});
+    tl_reverse_transform_script(&mut script, doclines);
+
+    script
+}
+
+fn main() {
+    let files: Vec<_> = main_preamble!(&"WSC.txt").collect();
+    let files = if files.is_empty() {
+        let args = std::env::args().collect::<Vec<_>>();
+        args.iter().skip(1).map(|it| PathBuf::from(it).join("nonexistant")).collect::<Vec<_>>()
+    } else {
+        files
+    };
+    let yaml_folder = files.first().unwrap().parent().unwrap().with_extension("yaml");
+    let output_folder = yaml_folder.with_extension("");
+    let file_desc_yaml = output_folder.join("files.yaml");
+    let ext_desc_yaml = output_folder.join("extensions.yaml");
+
+    for script_file in files {
+        if script_file.file_name().unwrap().to_string_lossy() == "nonexistant" {
+            break;
+        }
+
+        let text = std::fs::read_to_string(&script_file).unwrap();
+        let yaml_file = yaml_folder.join(script_file.file_name().unwrap()).with_extension("yaml");
+        let yaml_text = std::fs::read_to_string(&yaml_file).unwrap();
+
+        let yaml_script = untransform_wsc_file_command(&yaml_file, &yaml_text, &text);
+
+        let encoded_script = encode_wsc_file_command(&yaml_file, yaml_script);
+        std::fs::write(output_folder.join(yaml_file.with_extension("").file_name().unwrap()), encoded_script).unwrap();
+    }
+
+    {
+        let ext_descriptors: Vec<ExtensionDescriptor> = serde_yml::from_reader(std::fs::File::open(&ext_desc_yaml).unwrap()).unwrap();
+        let file_descriptors: Vec<FileDescriptor> = serde_yml::from_reader(std::fs::File::open(&file_desc_yaml).unwrap()).unwrap();
+
+        let mut file_desc_iter = file_descriptors.iter().peekable();
+
+        let mut out_files = vec![];
+        for ExtensionDescriptor { name: ext, number, .. } in ext_descriptors.iter() {
+            for _ in 0..*number {
+                if let Some(file_desc) = file_desc_iter.next() {
+                    let name = format!("{}.{}", file_desc.name, ext);
+                    out_files.push(output_folder.join(name));
+                } else {
+                    log::warn!("No more files left!");
+                }
+            }
+        }
+
+        let output = write_arc(&out_files, ext_descriptors, file_descriptors);
+        std::fs::write(output_folder.with_extension("arc.out"), output).unwrap();
+    }
+}

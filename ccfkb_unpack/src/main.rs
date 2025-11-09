@@ -1,23 +1,24 @@
 use std::env::current_dir;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use ccfkb_lib::data::{decode_wsc, fix_yaml_str, read_arc};
-use ccfkb_lib::{log, main};
+use ccfkb_lib::{log, main_preamble};
 use ccfkb_lib::data::text_script::tl_transform_script;
+use ccfkb_lib::util::safe_create_dir;
 
-main!(files, "ARC", {
+fn main() {
     let top_out_path = current_dir().unwrap().join("extracted_arcs");
-    std::fs::create_dir(&top_out_path).unwrap();
-    let files: Vec<_> = files.collect();
+    safe_create_dir(&top_out_path).unwrap();
+    let files: Vec<_> = main_preamble!(&"arc").collect();
 
     for i in files {
         let dirent = i;
         let out_folder_base_name = &top_out_path.join(dirent.file_name().unwrap());
-        let out_yaml_folder = &out_folder_base_name.with_extension("ARC.yaml");
-        let out_script_folder = &out_folder_base_name.with_extension("ARC.script");
+        let out_yaml_folder = &out_folder_base_name.with_extension("arc.yaml");
+        let out_script_folder = &out_folder_base_name.with_extension("arc.script");
 
-        std::fs::create_dir(&out_folder_base_name).unwrap();
-        std::fs::create_dir(&out_yaml_folder).unwrap();
-        std::fs::create_dir(&out_script_folder).unwrap();
+        safe_create_dir(&out_folder_base_name).unwrap();
+        safe_create_dir(&out_yaml_folder).unwrap();
+        safe_create_dir(&out_script_folder).unwrap();
 
         let mut file_contents = std::fs::read(&dirent).unwrap();
 
@@ -40,9 +41,11 @@ main!(files, "ARC", {
                 out_path
             })
             .collect();
-
+        log::info!("==============================================");
+        log::info!("              Decoding WSC files              ");
+        log::info!("==============================================");
         let output_file_paths: Vec<_> = output_file_paths.iter().filter_map(|file| {
-            if !file.extension().unwrap().to_string_lossy().contains("WSC") {
+            if !file.extension().unwrap().to_string_lossy().ends_with("WSC") {
                 return None;
             }
             let out_path = out_yaml_folder.join(file.file_name().unwrap()).with_extension("WSC.yaml");
@@ -52,12 +55,16 @@ main!(files, "ARC", {
             Some(out_path)
         }).collect();
 
+        log::info!("==============================================");
+        log::info!("          Transforming YAML files             ");
+        log::info!("==============================================");
+
         output_file_paths.iter().for_each(|file| {
-            let out_path = out_script_folder.join(file.file_name().unwrap()).with_extension("WSC.txt");
-            transform_wsc_file_command(&dirent, &out_path);
+            let out_path = out_script_folder.join(file.file_name().unwrap()).with_extension("txt");
+            transform_wsc_file_command(&file, &out_path);
         });
     }
-});
+}
 
 fn decode_wsc_file_command(wsc_name_path: &Path) -> String {
     log::info!("Decoding file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());

@@ -1,11 +1,11 @@
 use std::env::current_dir;
 use std::fs::create_dir_all;
 use std::path::Path;
-use ccfkb_lib::{log, main};
+use ccfkb_lib::{log, main_preamble};
 use ccfkb_lib::opcodes::Script;
 
-main!(files, "WSC.yaml", {
-    let files = files.collect::<Vec<_>>();
+fn main() {
+    let files = main_preamble!(&"WSC.yaml").collect::<Vec<_>>();
 
     let output_folder = files.first().unwrap().parent().unwrap().file_name().unwrap();
     
@@ -18,7 +18,7 @@ main!(files, "WSC.yaml", {
       }
       encode_wsc_file_command(&file, &out_dir_path)
     }
-});
+}
 
 fn encode_wsc_file_command(yaml_name_path: &Path, out_dir_path: &Path) {
     log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default().to_string_lossy());
@@ -28,5 +28,5 @@ fn encode_wsc_file_command(yaml_name_path: &Path, out_dir_path: &Path) {
 
     let out = script.binary_serialise();
 
-    std::fs::write(out_dir_path.join(yaml_name_path.file_name().unwrap().to_string_lossy().replace(".yaml", "")), out).unwrap();
+    std::fs::write(out_dir_path.join(yaml_name_path.with_extension("").file_name().unwrap()), out).unwrap();
 }
