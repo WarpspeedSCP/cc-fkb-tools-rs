@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "ccfkb_pack"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ccfkb_lib",
  "env_logger",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "ccfkb_unpack"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ccfkb_lib",
  "env_logger",
