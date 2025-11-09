@@ -4,7 +4,7 @@ use crate::opcodes::{Choice, OpField, Opcode, Script, TLString};
 use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while};
-use nom::combinator::{map_res, opt, value};
+use nom::combinator::{map_res, value};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{preceded, terminated};
 use nom::{AsChar, Parser};
