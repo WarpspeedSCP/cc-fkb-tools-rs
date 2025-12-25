@@ -1,12 +1,11 @@
-use std::env::current_dir;
-use std::path::Path;
-use ccfkb_lib::data::{decode_wsc, fix_yaml_str, read_arc};
-use ccfkb_lib::{log, main_preamble};
-use ccfkb_lib::data::text_script::tl_transform_script;
+use ccfkb_lib::bin_utils::{decode_wsc_file_command, transform_wsc_file_command};
+use ccfkb_lib::data::read_arc;
+use ccfkb_lib::util::current_dir;
 use ccfkb_lib::util::safe_create_dir;
+use ccfkb_lib::{log, main_preamble};
 
 fn main() {
-    let top_out_path = current_dir().unwrap().join("extracted_arcs");
+    let top_out_path = current_dir().join("extracted_arcs");
     safe_create_dir(&top_out_path).unwrap();
     let files: Vec<_> = main_preamble!(&"arc").collect();
 
@@ -45,7 +44,7 @@ fn main() {
         log::info!("              Decoding WSC files              ");
         log::info!("==============================================");
         let output_file_paths: Vec<_> = output_file_paths.iter().filter_map(|file| {
-            if !file.extension().unwrap().to_string_lossy().ends_with("WSC") {
+            if !file.extension().map(|it| it.ends_with("WSC")).unwrap_or_default() {
                 return None;
             }
             let out_path = out_yaml_folder.join(file.file_name().unwrap()).with_extension("WSC.yaml");
@@ -66,25 +65,4 @@ fn main() {
     }
 }
 
-fn decode_wsc_file_command(wsc_name_path: &Path) -> String {
-    log::info!("Decoding file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
-    let input = std::fs::read(wsc_name_path).unwrap();
 
-    let out = decode_wsc(&input);
-
-    let res = fix_yaml_str(serde_yml::to_string(&out).unwrap());
-
-    res
-}
-
-fn transform_wsc_file_command(wsc_name_path: &Path, out_file: &Path) {
-
-    log::info!("Transforming file {}", wsc_name_path.file_name().unwrap_or_default().to_string_lossy());
-    let input = std::fs::read_to_string(wsc_name_path).unwrap();
-
-    let script = serde_yml::from_str(&input).unwrap();
-
-    let out = tl_transform_script(&script);
-
-    std::fs::write(out_file, out).unwrap();
-}

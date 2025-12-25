@@ -1,18 +1,18 @@
-use std::path::{Path, PathBuf};
+use camino::{Utf8Path as Utf8Path, Utf8PathBuf as PathBuf};
 use ccfkb_lib::data::{write_arc, ExtensionDescriptor, FileDescriptor};
 use ccfkb_lib::{log, main_preamble};
 
 use ccfkb_lib::data::text_script::{parse_doclines, tl_reverse_transform_script};
 use ccfkb_lib::opcodes::Script;
 
-fn encode_wsc_file_command(yaml_name_path: &Path, script: Script) -> Vec<u8> {
-    log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default().to_string_lossy());
+fn encode_wsc_file_command(yaml_name_path: &Utf8Path, script: Script) -> Vec<u8> {
+    log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default());
     let out = script.binary_serialise();
     out
 }
 
-fn untransform_wsc_file_command(yaml_file: &Path, yaml_text: &str, text: &str) -> Script {
-    log::info!("Untransforming file {}", &yaml_file.file_name().unwrap_or_default().to_string_lossy());
+fn untransform_wsc_file_command(yaml_file: &Utf8Path, yaml_text: &str, text: &str) -> Script {
+    log::info!("Untransforming file {}", &yaml_file.file_name().unwrap_or_default());
     let mut script: Script = serde_yml::from_str(&yaml_text).unwrap();
     let (_, doclines) = parse_doclines(&text).unwrap();
 
@@ -29,18 +29,26 @@ fn main() {
     } else {
         files
     };
-    let yaml_folder = files.first().unwrap().parent().unwrap().with_extension("yaml");
+    let yaml_folder = files
+        .first()
+        .expect("Expected the folder to contain files!")
+        .parent()
+        .expect("Expected files.yaml and extensions.yaml to exist within the parent directory!")
+        .with_extension("yaml");
+
     let output_folder = yaml_folder.with_extension("");
     let file_desc_yaml = output_folder.join("files.yaml");
     let ext_desc_yaml = output_folder.join("extensions.yaml");
 
     for script_file in files {
-        if script_file.file_name().unwrap().to_string_lossy() == "nonexistant" {
+        // SAFETY: These files are expected to exist with valid utf8 names, nothing should be accessing them concurrently.
+        let file_name = script_file.file_name().unwrap();
+        if file_name == "nonexistant" {
             break;
         }
 
         let text = std::fs::read_to_string(&script_file).unwrap();
-        let yaml_file = yaml_folder.join(script_file.file_name().unwrap()).with_extension("yaml");
+        let yaml_file = yaml_folder.join(file_name).with_extension("yaml");
         let yaml_text = std::fs::read_to_string(&yaml_file).unwrap();
 
         let yaml_script = untransform_wsc_file_command(&yaml_file, &yaml_text, &text);

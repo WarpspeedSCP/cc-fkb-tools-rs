@@ -1,10 +1,10 @@
-use crate::opcodes::{Script, make_opcode};
+use crate::opcodes::{make_opcode, Script};
 use crate::util::{
   encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32,
   unwipf,
 };
+use camino::Utf8Path as Utf8Path;
 use serde_derive::{Deserialize, Serialize};
-use std::path::Path;
 
 pub mod text_script;
 
@@ -107,7 +107,7 @@ pub fn fix_yaml_str(it: String) -> String {
       .replace(r#""'"#, "")
 }
 
-pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Path, extract_wipf: bool) -> (Vec<ExtensionDescriptor>, Vec<FileDescriptor>, Vec<String>, Vec<&'a [u8]>) {
+pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bool) -> (Vec<ExtensionDescriptor>, Vec<FileDescriptor>, Vec<String>, Vec<&'a [u8]>) {
   let n_ext_descriptors = transmute_to_u32(0, input);
 
   let mut ext_descriptors = vec![];
@@ -196,7 +196,7 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Path, extract_wipf: bool) 
   (ext_descriptors, files, filenames, contents)
 }
 
-pub fn write_arc<T: AsRef<Path>>(input_files: &[T], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> Vec<u8> {
+pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> Vec<u8> {
   let mut output = vec![];
 
   output.extend((extensions.len() as u32).to_le_bytes());
@@ -212,7 +212,7 @@ pub fn write_arc<T: AsRef<Path>>(input_files: &[T], extensions: Vec<ExtensionDes
   let mut curr_offset = output.len() + (13 + 4 + 4) * files.len(); // the size of a file descriptor.
 
   for (descriptor, curr_path) in files.iter().zip(input_files.iter().map(AsRef::as_ref)) {
-    log::info!("Packing {}", curr_path.display());
+    log::info!("Packing {}", curr_path);
 
     let mut sjis_name = encode_sjis(&descriptor.name);
     let sjis_name = if sjis_name.len() < 13 {
@@ -225,7 +225,7 @@ pub fn write_arc<T: AsRef<Path>>(input_files: &[T], extensions: Vec<ExtensionDes
     output.extend(sjis_name);
     let mut contents = std::fs::read(&curr_path).unwrap();
 
-    if curr_path.file_name().unwrap().to_string_lossy().ends_with("WSC") {
+    if curr_path.file_name().map(|it| it.ends_with("WSC")).unwrap_or_default() {
       rotate_wsc_for_pack(&mut contents)
     }
 
@@ -250,7 +250,7 @@ fn rotate_wsc_for_pack(input: &mut [u8]) {
   input.iter_mut().for_each(|chr| *chr = chr.rotate_left(2));
 }
 
-fn do_extract_wipf(filename: &str, output_file_path: &Path, content: &mut [u8]) -> () {
+fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u8]) -> () {
   let header = WIPFHeader::from_ref(content);
   let entries =
     WIPFENTRY::from_ref_as_slice(&content[size_of_val(header)..], header.n_entries as usize);

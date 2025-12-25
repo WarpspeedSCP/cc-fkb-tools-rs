@@ -196,7 +196,6 @@ impl Script {
     for op in &self.opcodes {
       let op = adjust_single_opcode(op.clone(), &jump_map, &self.opcodes);
       let serialised = op.binary_serialise();
-      actual_address += serialised.len();
       buf.extend(serialised);
     }
 

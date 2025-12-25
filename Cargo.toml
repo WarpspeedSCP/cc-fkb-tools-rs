@@ -2,22 +2,8 @@
 resolver = "3"
 
 members = [
-    "ccfkb_pack",
-    "ccfkb_unpack",
-    "ccfkb_extract",
-    "ccfkb_compress",
-    "ccfkb_encode",
-    "ccfkb_decode",
-    "ccfkb_transform",
-    "ccfkb_untransform",
     "ccfkb_lib"
 ]
-
-[workspace.dependencies]
-ccfkb_lib = { path = "ccfkb_lib" }
-env_logger = "0.11.8"
-serde_yml = "0.0.12"
-windows = { version = "0.62.2", features = ["Win32", "Win32_System", "Win32_System_Console", "Win32_UI", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
 [profile.release]
 strip = true  # Automatically strip symbols from the binary.

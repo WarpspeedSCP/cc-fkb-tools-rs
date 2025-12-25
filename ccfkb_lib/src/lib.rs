@@ -1,17 +1,19 @@
 pub mod data;
 pub mod opcodes;
 pub mod util;
+pub mod bin_utils;
 
-pub use walkdir;
-pub use once_cell;
 pub use itertools;
 pub use log;
+pub use once_cell;
 pub use rayon;
+pub use walkdir;
 
 #[macro_export]
 macro_rules! main_preamble {
      ($type: expr) => {
           {
+            use camino::Utf8PathBuf as PathBuf;
             use env_logger::Env;
             use ccfkb_lib::walkdir;
             let env = Env::new().default_filter_or("info");
@@ -58,7 +60,7 @@ macro_rules! main_preamble {
                       ccfkb_lib::log::info!("{}", it.path().display());
                       it.file_type().is_file() && (str::is_empty($type) || ccfkb_lib::util::ends_with_ignore_case(&it.file_name().to_string_lossy(), $type))
                     })
-                    .map(|it| it.into_path())
+                    .map(|it| PathBuf::from_path_buf(it.into_path()).unwrap())
             });
             
             files
@@ -67,6 +69,7 @@ macro_rules! main_preamble {
     
     ($dirs: ident) => {
          {
+            use camino::Utf8PathBuf as PathBuf;
             use env_logger::Env;
             use ccfkb_lib::walkdir;
             let env = Env::new().default_filter_or("info");
@@ -109,6 +112,7 @@ macro_rules! main_preamble {
                     .into_iter()
                     .filter_map(|it| it.ok())
                     .filter(|it| it.file_type().is_dir())
+                    .map(|it| PathBuf::from_path_buf(it.into_path()).unwrap())
             });
             
             dirs

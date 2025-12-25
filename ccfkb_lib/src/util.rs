@@ -1,3 +1,4 @@
+
 pub fn transmute_to_array<const SIZE: usize>(address: usize, input: &[u8]) -> [u8; SIZE] {
   input[address..address + SIZE].try_into().unwrap()
 }
@@ -10,7 +11,11 @@ pub fn transmute_to_u16(address: usize, input: &[u8]) -> u16 {
   u16::from_le_bytes(transmute_to_array(address, input))
 }
 
-pub fn safe_create_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub fn current_dir() -> camino::Utf8PathBuf {
+  camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap()
+}
+
+pub fn safe_create_dir(dir: &camino::Utf8Path) -> std::io::Result<()> {
   std::fs::create_dir(dir).or_else(|it| {
     if it.kind() == std::io::ErrorKind::AlreadyExists {
       Ok(())

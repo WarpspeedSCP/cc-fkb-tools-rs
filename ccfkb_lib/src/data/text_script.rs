@@ -1,17 +1,17 @@
-use std::collections::HashMap;
 use crate::opcodes::{Choice, OpField, Opcode, Script, TLString};
+use std::collections::HashMap;
 
-use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while};
 use nom::combinator::{map_res, value};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{preceded, terminated};
+use nom::IResult;
 use nom::{AsChar, Parser};
 use once_cell::sync::Lazy;
 
-use std::fmt::Formatter;
 use crate::util::{escape_str, unescape_str};
+use std::fmt::Formatter;
 
 const TL_CHOICE_END: Lazy<String> = Lazy::new(|| "---~~~---".to_string());
 const TL_LINE_END: Lazy<String> = Lazy::new(|| "---===---".to_string());
@@ -348,25 +348,25 @@ impl std::fmt::Display for DocLine {
   }
 }
 
-impl DocLine {
-  fn line_type_string(&self) -> &str {
-    match self {
-      DocLine::Scene(_) => "Scene",
-      DocLine::Line(_) => "Line",
-      DocLine::SpeakerLine(_) => "SpeakerLine",
-      DocLine::Choices(_) => "Choices",
-    }
-  }
-
-  fn address(&self) -> u32 {
-    match self {
-      DocLine::Scene(Line { address, .. }) => *address,
-      DocLine::Line(Line { address, .. }) => *address,
-      DocLine::SpeakerLine(SpeakerLine { address, .. }) => *address,
-      DocLine::Choices(ChoiceLine { address, .. }) => *address,
-    }
-  }
-}
+// impl DocLine {
+//   fn line_type_string(&self) -> &str {
+//     match self {
+//       DocLine::Scene(_) => "Scene",
+//       DocLine::Line(_) => "Line",
+//       DocLine::SpeakerLine(_) => "SpeakerLine",
+//       DocLine::Choices(_) => "Choices",
+//     }
+//   }
+//
+//   fn address(&self) -> u32 {
+//     match self {
+//       DocLine::Scene(Line { address, .. }) => *address,
+//       DocLine::Line(Line { address, .. }) => *address,
+//       DocLine::SpeakerLine(SpeakerLine { address, .. }) => *address,
+//       DocLine::Choices(ChoiceLine { address, .. }) => *address,
+//     }
+//   }
+// }
 
 fn is_blank(input: &str) -> bool {
   input.is_empty() || input.chars().all(|it| it.is_space() || it.is_newline())
