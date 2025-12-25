@@ -2,6 +2,7 @@ pub mod data;
 pub mod opcodes;
 pub mod util;
 pub mod bin_utils;
+pub mod logging;
 
 pub use itertools;
 pub use log;
@@ -14,41 +15,45 @@ macro_rules! main_preamble {
      ($type: expr) => {
           {
             use camino::Utf8PathBuf as PathBuf;
-            use env_logger::Env;
+            // use env_logger::Env;
             use ccfkb_lib::walkdir;
-            let env = Env::new().default_filter_or("info");
+            use ccfkb_lib::logging;
 
-            let target_buffer: env_logger::Target = {
-              #[cfg(not(target_os="windows"))]
-              {
-                if let Ok(log_file_name) = std::env::var("LOG_FILE") {
-                  env_logger::Target::Pipe(Box::from(std::fs::File::create(log_file_name).unwrap()))
-                } else {
-                  env_logger::Target::Stderr
-                }
-              }
-              #[cfg(target_os="windows")]
-              unsafe {
-                use windows;
-                let console_win = windows::Win32::System::Console::GetConsoleWindow();
-                let res = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(console_win, None);
+            logging::init().unwrap();
 
-                if let Ok(log_file_name) = std::env::var("LOG_FILE") {
-                  env_logger::Target::Pipe(Box::from(std::fs::File::create(log_file_name).unwrap()))
-                } else if windows::Win32::System::Threading::GetCurrentProcessId() != res {
-                  env_logger::Target::Pipe(Box::new(std::fs::File::create(env!("CARGO_CRATE_NAME").to_string() + ".log").unwrap()))
-                } else {
-                  env_logger::Target::Stderr
-                }
-              }
-            };
+            // let env = Env::new().default_filter_or("info");
 
-            env_logger::builder()
-                .format_timestamp(None)
-                .target(target_buffer)
-                .format_level(true)
-                .parse_env(env)
-                .init();
+            // let target_buffer: env_logger::Target = {
+            //   #[cfg(not(target_os="windows"))]
+            //   {
+            //     if let Ok(log_file_name) = std::env::var("LOG_FILE") {
+            //       env_logger::Target::Pipe(Box::from(std::fs::File::create(log_file_name).unwrap()))
+            //     } else {
+            //       env_logger::Target::Stderr
+            //     }
+            //   }
+            //   #[cfg(target_os="windows")]
+            //   unsafe {
+            //     use windows;
+            //     let console_win = windows::Win32::System::Console::GetConsoleWindow();
+            //     let res = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(console_win, None);
+						//
+            //     if let Ok(log_file_name) = std::env::var("LOG_FILE") {
+            //       env_logger::Target::Pipe(Box::from(std::fs::File::create(log_file_name).unwrap()))
+            //     } else if windows::Win32::System::Threading::GetCurrentProcessId() != res {
+            //       env_logger::Target::Pipe(Box::new(std::fs::File::create(env!("CARGO_CRATE_NAME").to_string() + ".log").unwrap()))
+            //     } else {
+            //       env_logger::Target::Stderr
+            //     }
+            //   }
+            // };
+						//
+            // env_logger::builder()
+            //     .format_timestamp(None)
+            //     .target(target_buffer)
+            //     .format_level(true)
+            //     .parse_env(env)
+            //     .init();
             
             let args = std::env::args().skip(1).collect::<Vec<_>>();
             
@@ -119,3 +124,5 @@ macro_rules! main_preamble {
          }
     }
  }
+
+
