@@ -37,8 +37,8 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
         let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
 
         if opcode.opcode == 0x41 {
-          match opcode.fields.get_mut(3) {
-            Some(OpField::String(orig_str)) => {
+          match &mut opcode.fields[3] {
+            OpField::String(orig_str) => {
               let _ = std::mem::replace(orig_str, line.translation);
             }
             _ => {}
@@ -49,8 +49,8 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
         let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
 
         if opcode.opcode == 0xE0 {
-          match opcode.fields.get_mut(0) {
-            Some(OpField::String(orig_str)) => {
+          match &mut opcode.fields[0] {
+            OpField::String(orig_str) => {
               let _ = std::mem::replace(orig_str, line.translation);
             }
             _ => {}
@@ -61,15 +61,15 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
       DocLine::SpeakerLine(line) => {
         let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
         if opcode.opcode == 0x42 {
-          match opcode.fields.get_mut(4) {
-            Some(OpField::String(orig_str)) => {
+          match &mut opcode.fields[4] {
+            OpField::String(orig_str) => {
               let _ = std::mem::replace(orig_str, line.speaker_translation);
             }
             _ => {}
           };
 
-          match opcode.fields.get_mut(5) {
-            Some(OpField::String(orig_str)) => {
+          match &mut opcode.fields[5] {
+            OpField::String(orig_str) => {
               let _ = std::mem::replace(orig_str, line.translation);
             }
             _ => {}
@@ -79,8 +79,8 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
       DocLine::Choices(choice) => {
         let opcode = addr2opcode.get_mut(&(choice.address as usize)).unwrap();
         if opcode.opcode == 0x02 {
-          match opcode.fields.get_mut(2) {
-            Some(OpField::Choice(orig_choices)) => {
+          match &mut opcode.fields[2] {
+            OpField::Choice(orig_choices) => {
               orig_choices
                   .into_iter()
                   .zip(choice.choices.into_iter())
