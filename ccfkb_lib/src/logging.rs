@@ -1,4 +1,4 @@
-use log::{Level, Log, Metadata, Record};
+use log::{Level, Metadata, Record};
 use std::env;
 use std::io::Write;
 use std::str::FromStr;
@@ -27,15 +27,15 @@ impl log::Log for SimpleLogger {
 
 			match output {
 				LogOutput::None => {}
-				LogOutput::Stderr => eprintln!("[{} <time unknown>] ({}) {}", record.level(), record.file().unwrap_or("???"), record.args()),
-				LogOutput::Stdout => println!("[{} <time unknown>] ({}) {}", record.level(), record.file().unwrap_or("???"), record.args()),
+				LogOutput::Stderr => eprintln!("[{}] {} ({}:{})", record.level(), record.args(), record.file().unwrap_or("???"), record.line().unwrap_or(0)),
+				LogOutput::Stdout => println!("[{}] {} ({}:{})", record.level(), record.args(), record.file().unwrap_or("???"), record.line().unwrap_or(0)),
 				LogOutput::File(mutex) => {
 					let res = mutex.lock().map_err(|_err| "Could not lock log file!").and_then(|ref mut w| {
-						writeln!(w, "[{} <time unknown>] ({}) {}", record.level(), record.file().unwrap_or("???"), record.args()).map_err(|_err| "Could not write to log file!")
+						writeln!(w, "[{}] {} ({}:{})", record.level(), record.args(), record.file().unwrap_or("???"), record.line().unwrap_or(0)).map_err(|_err| "Could not write to log file!")
 					});
 
 					if let Err(e) = res {
-						eprintln!("[{} <time unknown>] ({}) {e}", Level::Error, record.file().unwrap_or("???"));
+						eprintln!("[{}] ({}:{}) {e}", Level::Error, record.file().unwrap_or("???"), record.line().unwrap_or(0));
 						eprintln!("Original log message: {}", record.args());
 					}
 				}

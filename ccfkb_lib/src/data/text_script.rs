@@ -445,7 +445,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 					preceded(tag("\n[choice translation]:"), take_until("\n[")),
 					preceded(tag("\n[choice notes]:"), take_until(TL_CHOICE_END.as_str())),
 				),
-				(tag(TL_CHOICE_END.as_str()), alt((take_until("\n["), take_until(TL_LINE_END.as_str())))),
+				tag(TL_CHOICE_END.as_str()),
 			)).parse(rest)?;
 
 			for (raw, choice_tl, choice_notes) in stuff {
@@ -468,7 +468,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 				});
 			}
 
-			let (rest, _) = tag(TL_LINE_END.as_str()).parse(rest)?;
+			let (rest, _) = (tag("\n"), tag(TL_LINE_END.as_str())).parse(rest)?;
 			return Ok((rest, DocLine::Choices(choiceline)));
 		}
 	};

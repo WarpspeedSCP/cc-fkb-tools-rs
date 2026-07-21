@@ -235,7 +235,7 @@ pub fn unwipf(input: &[u8], out_len: usize) -> Vec<u8> {
 	let mut ring = [0u8; 4096];
 	// //	unsigned long ring_index  = 0xFEE;                       // 剪贴板的索引
 	// 	unsigned long  ring_index = 1;                           // 剪贴板的索引
-	let mut ring_index = 0xFEEusize;
+	let mut ring_index = 0x1usize;//0xFEEusize;
 	// 	unsigned char* end        = buff + len;                  // 指向输入array的末尾
 	let end = input.len();
 
@@ -259,14 +259,11 @@ pub fn unwipf(input: &[u8], out_len: usize) -> Vec<u8> {
 			}
 			// 			if (flags & 0x01) { // 判断：最低位是否为1
 			if flags & 1 == 1 {
-				// 			/*
-				// 			*out_buff = ring[ring_index % ring_len] = *buff++; // 从ring[ 1 ]开始赋值到[ 0 ]，以4096循环
+				ring[ring_index % 4096] = input[buff];
 				out[out_buff] = ring[ring_index % 4096];
-				// 			ring_index++;
 				ring_index += 1;
-				// 			*out_buff++;
 				out_buff += 1;
-			// 			*/
+				buff += 1;
 			// 		    *out_buff++ = ring[ring_index++ % ring_len] = *buff++; //<2>
 			// 			} else {
 			} else {

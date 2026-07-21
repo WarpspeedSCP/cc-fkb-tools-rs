@@ -1,8 +1,5 @@
 use crate::opcodes::{make_opcode, Script};
-use crate::util::{
-  encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, to_bytes, transmute_to_u32,
-  unwipf,
-};
+use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, unwipf};
 use camino::Utf8Path as Utf8Path;
 use serde_derive::{Deserialize, Serialize};
 
@@ -121,9 +118,7 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 		let start_offset = transmute_to_u32(curr_idx, input);
 		curr_idx += 4;
 
-		log::info!(
-      "File type: {unicode} has {n_files} files with descriptors starting at 0x{start_offset:08X}"
-    );
+		log::info!("File type: {unicode} has {n_files} files with descriptors starting at 0x{start_offset:08X}");
 
 		ext_descriptors.push(ExtensionDescriptor {
 			name: unicode,
@@ -133,9 +128,9 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 	}
 
 	log::info!(
-    "There are {} files to process.",
-    ext_descriptors.iter().map(|it| it.number).sum::<u32>()
-  );
+		"There are {} files to process.",
+		ext_descriptors.iter().map(|it| it.number).sum::<u32>()
+	);
 
 	let mut filenames = vec![];
 	let mut files = vec![];
@@ -151,10 +146,10 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 			let offset = transmute_to_u32(descriptor_ptr, input);
 			descriptor_ptr += 4;
 			log::debug!(
-        "File {file_name}.{} of size 0x{size:08X} starts at 0x{offset:08X}",
-        ext_descriptor.name.as_str()
-      );
-			filenames.push(format!("{}.{}", file_name, ext_descriptor.name));
+				"File {file_name}.{} of size 0x{size:08X} starts at 0x{offset:08X}",
+				ext_descriptor.name.as_str()
+			);
+			filenames.push(format!("{file_name}.{}", ext_descriptor.name));
 			files.push(
 				FileDescriptor {
 					name: file_name,
@@ -254,20 +249,22 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 	let entries =
 		WIPFENTRY::from_ref_as_slice(&content[size_of_val(header)..], header.n_entries as usize);
 
-	log::warn!(
-        "WIPF file {filename} has {} entries with depth {}.",
-        entries.len(),
-        u32::from(header.depth)
-      );
+	log::debug!(
+		"WIPF file {filename} has {} entries with depth {}.",
+		entries.len(),
+		u32::from(header.depth)
+	);
+
+	safe_create_dir(&output_file_path).expect(&format!("Couldn't create output file for {filename} at {output_file_path}"));
 
 	let data = &content[size_of_val(header) + size_of_val(entries)..];
 	let mut data_ptr = 0usize;
 	for (entry_no, entry) in entries.iter().enumerate() {
-		log::warn!(
-          "    entry is {}x{}",
-          u32::from(entry.width),
-          u32::from(entry.height)
-        );
+		log::debug!(
+		  "    entry is {}x{}",
+		  u32::from(entry.width),
+		  u32::from(entry.height)
+		);
 
 		let palette = if header.depth == 8 {
 			let palette = &data[data_ptr..data_ptr + 1024];
@@ -278,8 +275,8 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 		};
 
 		let out_depth = header.depth as u32 / 8;
-		let out_stride = (entry.width * out_depth + 3) & !3u32;
-		let out_len = (entry.height * out_stride) as usize;
+		let out_stride = ((entry.width * out_depth + 3) & !3u32) as usize;
+		let out_len = entry.height as usize * out_stride;
 
 		let out_buf = unwipf(&data[data_ptr..(data_ptr + entry.length as usize)], out_len);
 
@@ -292,7 +289,7 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 		));
 
 		let mut out_buf = if header.depth == 24 {
-			let mut new_out = vec![0u8; out_buf.len()];
+			let mut new_out = vec![0u8; out_len];
 
 			let clr_stride = entry.width as usize;
 			let clr_len = entry.height as usize * clr_stride;
@@ -304,7 +301,7 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 					start..(start + len)
 				}
 
-				let out_rgb_line = &mut new_out[curr_line_offset..(curr_line_offset + clr_stride)];
+				let out_rgb_line = &mut new_out[mkrange(y * out_stride, out_stride)];
 
 				let r_range = mkrange(curr_line_offset, clr_stride);
 				let g_range = mkrange(curr_line_offset + clr_len, clr_stride);
@@ -314,15 +311,16 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 				let g_line = &out_buf[g_range];
 				let b_line = &out_buf[b_range];
 
-				for x in 0..entry.width as usize {
-					out_rgb_line[x] = r_line[x];
-					out_rgb_line[x] = g_line[x];
-					out_rgb_line[x] = b_line[x];
+				for x in 0..(out_stride - 3) {
+					out_rgb_line[ x     ] = r_line[x / 3];
+					out_rgb_line[ x + 1 ] = g_line[x / 3];
+					out_rgb_line[ x + 2 ] = b_line[x / 3];
 				}
 			}
 
 			new_out
 		} else {
+			// TODO: apply palette colour?
 			out_buf
 		};
 
@@ -366,7 +364,6 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 			nimpcolors: 0,
 		};
 
-		std::fs::create_dir_all(&output_file_path).unwrap();
 		let hdr_bytes = to_bytes(&bmp_header);
 		let dib_bytes = to_bytes(&bmp_dib_header);
 		std::fs::write(
@@ -397,11 +394,11 @@ pub fn decode_wsc(input: &[u8]) -> Script {
 		let op = make_opcode(&input[ptr..], ptr);
 		if let Some(op) = op {
 			log::debug!(
-        "Got 0x{:02X} of length 0x{:02X} at 0x{:08X}",
-        op.opcode,
-        op.size(),
-        ptr
-      );
+				"Got 0x{:02X} of length 0x{:02X} at 0x{:08X}",
+				op.opcode,
+				op.size(),
+				ptr
+			);
 			at_end = op.opcode == 0xFF;
 			ptr += op.size();
 			opcodes.push(op);
