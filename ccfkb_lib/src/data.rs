@@ -104,6 +104,7 @@ pub fn fix_yaml_str(it: String) -> String {
 		.replace(r#""'"#, "")
 }
 
+#[must_use]
 pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bool) -> (Vec<ExtensionDescriptor>, Vec<FileDescriptor>, Vec<String>, Vec<&'a [u8]>) {
 	let n_ext_descriptors = transmute_to_u32(0, input);
 
@@ -180,7 +181,13 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 		if filename.ends_with("WSC") {
 			rotate_wsc_for_unpack(content);
 		} else if &content[..4] == "WIPF".as_bytes() && extract_wipf {
-			do_extract_wipf(&filename, &output_file_path, content);
+			let res = do_extract_wipf(&filename, &output_file_path, content);
+			match res {
+				Ok(_) => {}
+				Err(err) => {
+					log::error!("Error while extracting WIPF image {filename}: {}", err);
+				}
+			}
 		}
 
 		// Converts the mut ref back into a normal reference.
@@ -190,6 +197,7 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 	(ext_descriptors, files, filenames, contents)
 }
 
+#[must_use]
 pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> Vec<u8> {
 	let mut output = vec![];
 
@@ -237,14 +245,18 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 
 
 fn rotate_wsc_for_unpack(input: &mut [u8]) {
-	input.iter_mut().for_each(|chr| *chr = chr.rotate_right(2));
+	for i in input.iter_mut() {
+		*i = i.rotate_right(2);
+	}
 }
 
 fn rotate_wsc_for_pack(input: &mut [u8]) {
-	input.iter_mut().for_each(|chr| *chr = chr.rotate_left(2));
+	for i in input.iter_mut() {
+		*i = i.rotate_left(2);
+	}
 }
 
-fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u8]) -> () {
+fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u8]) -> std::io::Result<()> {
 	let header = WIPFHeader::from_ref(content);
 	let entries =
 		WIPFENTRY::from_ref_as_slice(&content[size_of_val(header)..], header.n_entries as usize);
@@ -311,10 +323,11 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 				let g_line = &out_buf[g_range];
 				let b_line = &out_buf[b_range];
 
-				for x in 0..(out_stride - 3) {
-					out_rgb_line[ x     ] = r_line[x / 3];
-					out_rgb_line[ x + 1 ] = g_line[x / 3];
-					out_rgb_line[ x + 2 ] = b_line[x / 3];
+				for x in (0..out_stride).step_by(3) {
+					let x_idx = x / 3;
+					out_rgb_line[ x     ] = r_line[x_idx];
+					out_rgb_line[ x + 1 ] = g_line[x_idx];
+					out_rgb_line[ x + 2 ] = b_line[x_idx];
 				}
 			}
 
@@ -324,15 +337,16 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 			out_buf
 		};
 
+		let row_size = entry.width as usize * out_depth as usize;
 		for i in 0..(entry.height / 2) as usize {
 			for j in 0..(entry.width * out_depth) as usize {
-				let a = out_buf
-					[(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j];
-				let b = out_buf[i * entry.width as usize * out_depth as usize + j];
+				let row_idx = (entry.height as usize - i - 1) * row_size + j;
+				let col_idx = i * row_size + j;
 
-				out_buf
-					[(entry.height as usize - i - 1) * entry.width as usize * out_depth as usize + j] = b;
-				out_buf[i * entry.width as usize * out_depth as usize + j] = a;
+				let a = out_buf[row_idx];
+				let b = out_buf[col_idx];
+				out_buf[row_idx] = b;
+				out_buf[col_idx] = a;
 			}
 		}
 
@@ -366,31 +380,25 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 
 		let hdr_bytes = to_bytes(&bmp_header);
 		let dib_bytes = to_bytes(&bmp_dib_header);
-		std::fs::write(
-			out_file,
-			hdr_bytes
-				.iter()
-				.chain(dib_bytes)
-				.chain(if header.depth == 8 { palette } else { &[] })
-				.chain(out_buf.iter())
-				.copied()
-				.collect::<Vec<u8>>(),
-		)
-			.unwrap();
+		let mut res = Vec::with_capacity(hdr_bytes.len() + dib_bytes.len() + palette.len() + out_buf.len());
+
+		res.extend_from_slice(&hdr_bytes);
+		res.extend_from_slice(&dib_bytes);
+		res.extend_from_slice(&palette);
+		res.extend_from_slice(&out_buf);
+
+		std::fs::write(&out_file, &res)?;
 	}
+
+	Ok(())
 }
 
 pub fn decode_wsc(input: &[u8]) -> Script {
 	let mut ptr = 0;
-	let mut ptr_old = 1;
 	let mut opcodes = vec![];
 	let mut at_end = false;
 
 	while ptr < input.len() {
-		if ptr_old == ptr {
-			break;
-		}
-
 		let op = make_opcode(&input[ptr..], ptr);
 		if let Some(op) = op {
 			log::debug!(
@@ -403,8 +411,8 @@ pub fn decode_wsc(input: &[u8]) -> Script {
 			ptr += op.size();
 			opcodes.push(op);
 		} else {
-			ptr_old = ptr;
 			log::error!("Unknown opcode at 0x{:08X}", ptr);
+			break;
 		}
 		if at_end {
 			break;

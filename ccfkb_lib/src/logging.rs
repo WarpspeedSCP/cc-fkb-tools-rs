@@ -13,6 +13,7 @@ enum LogOutput {
 
 struct SimpleLogger {
 	level: Level,
+	log_filenames: bool,
 	output_buffers: [LogOutput; 6],
 }
 
@@ -24,18 +25,22 @@ impl log::Log for SimpleLogger {
 	fn log(&self, record: &Record) {
 		if self.enabled(record.metadata()) {
 			let output = &self.output_buffers[record.level() as usize];
-
+			let file_str = if self.log_filenames {
+				format!("({}:{})", record.file().unwrap_or("???"), record.line().unwrap_or(0))
+			} else {
+				"".to_owned()
+			};
 			match output {
 				LogOutput::None => {}
-				LogOutput::Stderr => eprintln!("[{}] {} ({}:{})", record.level(), record.args(), record.file().unwrap_or("???"), record.line().unwrap_or(0)),
-				LogOutput::Stdout => println!("[{}] {} ({}:{})", record.level(), record.args(), record.file().unwrap_or("???"), record.line().unwrap_or(0)),
+				LogOutput::Stderr => eprintln!("[{}] {} {file_str}", record.level(), record.args()),
+				LogOutput::Stdout => println!("[{}] {} {file_str}", record.level(), record.args()),
 				LogOutput::File(mutex) => {
 					let res = mutex.lock().map_err(|_err| "Could not lock log file!").and_then(|ref mut w| {
-						writeln!(w, "[{}] {} ({}:{})", record.level(), record.args(), record.file().unwrap_or("???"), record.line().unwrap_or(0)).map_err(|_err| "Could not write to log file!")
+						writeln!(w, "[{}] {} {file_str}", record.level(), record.args()).map_err(|_err| "Could not write to log file!")
 					});
 
 					if let Err(e) = res {
-						eprintln!("[{}] ({}:{}) {e}", Level::Error, record.file().unwrap_or("???"), record.line().unwrap_or(0));
+						eprintln!("[{}] {file_str} {e}", Level::Error);
 						eprintln!("Original log message: {}", record.args());
 					}
 				}
@@ -115,6 +120,7 @@ impl SimpleLogger {
 
 		Box::new(SimpleLogger {
 			level: matching_level,
+			log_filenames: false,
 			output_buffers
 		})
 	}
