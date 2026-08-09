@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 
 use ccfkb_lib::bin_utils::{decode_wsc_file_command, transform_wsc_file_command};
-use ccfkb_lib::data::read_arc;
+use ccfkb_lib::data::{read_arc, ArcContents};
 use ccfkb_lib::util::current_dir;
 use ccfkb_lib::util::safe_create_dir;
 use ccfkb_lib::{log, main_preamble};
@@ -23,10 +23,15 @@ fn main() {
 
 		let mut file_contents = std::fs::read(&dirent).unwrap();
 
-		let (exts, files, filenames, data) = read_arc(&mut file_contents[..], &out_folder_base, true);
+		let ArcContents { 
+			extensions,
+			files,
+			filenames,
+			data 
+		} = read_arc(&mut file_contents[..], &out_folder_base, true);
 
 		let exts_yml_path = out_folder_base.join("extensions.yaml");
-		let exts_yml = serde_yml::to_string(&exts).unwrap();
+		let exts_yml = serde_yml::to_string(&extensions).unwrap();
 		std::fs::write(&exts_yml_path, &exts_yml).unwrap();
 
 		let files_yml_path = out_folder_base.join("files.yaml");

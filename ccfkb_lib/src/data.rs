@@ -104,8 +104,15 @@ pub fn fix_yaml_str(it: String) -> String {
 		.replace(r#""'"#, "")
 }
 
+pub struct ArcContents<'a> {
+	pub extensions: Vec<ExtensionDescriptor>,
+	pub files: Vec<FileDescriptor>,
+	pub filenames: Vec<String>,
+	pub data: Vec<&'a[u8]>,
+}
+
 #[must_use]
-pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bool) -> (Vec<ExtensionDescriptor>, Vec<FileDescriptor>, Vec<String>, Vec<&'a [u8]>) {
+pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bool) -> ArcContents<'a> {
 	let n_ext_descriptors = transmute_to_u32(0, input);
 
 	let mut ext_descriptors = vec![];
@@ -194,7 +201,12 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 		contents.push(&*content);
 	}
 
-	(ext_descriptors, files, filenames, contents)
+	ArcContents {
+		extensions: ext_descriptors,
+		files,
+		filenames,
+		data: contents,
+	}
 }
 
 #[must_use]
