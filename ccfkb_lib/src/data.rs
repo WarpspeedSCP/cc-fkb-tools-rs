@@ -1,6 +1,8 @@
+use std::path::PathBuf;
 use crate::opcodes::{make_opcode, Script};
-use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, unwipf};
-use camino::Utf8Path as Utf8Path;
+use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress};
+use camino::{Utf8Path as Utf8Path, Utf8PathBuf};
+use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
 
 pub mod text_script;
@@ -13,6 +15,14 @@ pub struct WIPFHeader {
 }
 
 impl WIPFHeader {
+
+	fn new(n_entries: u16, depth: u16) -> Self {
+		WIPFHeader {
+			signature: *b"WIPF",
+			n_entries,
+			depth,
+		}
+	}
 	fn from_ref(slice: &[u8]) -> &Self {
 		if slice.len() < size_of::<Self>() {
 			panic!("bad input slice for wipfheader!");
@@ -298,110 +308,125 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 			&[]
 		};
 
-		let out_depth = header.depth as u32 / 8;
+		let raw_depth = header.depth;
+		let out_depth = raw_depth as u32 / 8;
 		let out_stride = ((entry.width * out_depth + 3) & !3u32) as usize;
 		let out_len = entry.height as usize * out_stride;
 
-		let out_buf = unwipf(&data[data_ptr..(data_ptr + entry.length as usize)], out_len);
+		let out_buf = lz77_decompress(&data[data_ptr..(data_ptr + entry.length as usize)], out_len);
+
+		if out_buf.len() < out_len {
+			log::error!("Could not decompress WIPF entry {entry_no:02} for file {filename}, expected 0x{out_len:08X} bytes but got only 0x{:08X} bytes", out_buf.len());
+			return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "WIPF entry out of bounds"));
+		}
 
 		data_ptr += entry.length as usize;
 
-		let out_file = output_file_path.join(&format!(
-			"{filename}_{entry_no:03}+{}x{}y.bmp",
-			u32::from(entry.x_offset),
-			u32::from(entry.y_offset)
-		));
+		write_wip_entry(&filename, output_file_path, header, &entry_no, &entry, &palette, raw_depth, out_depth, out_stride, out_len, out_buf)?;
+	}
 
-		let mut out_buf = if header.depth == 24 {
-			let mut new_out = vec![0u8; out_len];
+	Ok(())
+}
 
-			let clr_stride = entry.width as usize;
-			let clr_len = entry.height as usize * clr_stride;
+fn write_wip_entry(
+	filename: &str,
+	output_file_path: &Utf8Path,
+	header: &WIPFHeader,
+	entry_no: &usize,
+	entry: &WIPFENTRY,
+	palette: &[u8],
+	raw_depth: u16,
+	out_depth: u32,
+	out_stride: usize,
+	out_len: usize,
+	out_buf: Vec<u8>
+) -> std::io::Result<()> {
+	let out_file = output_file_path.join(&format!(
+		"{filename}_{entry_no:03}-d{raw_depth:02}+{}x{}y.bmp",
+		u32::from(entry.x_offset),
+		u32::from(entry.y_offset)
+	));
 
-			for y in 0..(entry.height as usize) {
-				let curr_line_offset = y * clr_stride;
+	let out_buf = if header.depth == 24 {
+		let mut new_out = vec![0u8; out_len];
 
-				fn mkrange(start: usize, len: usize) -> std::ops::Range<usize> {
-					start..(start + len)
-				}
+		let clr_stride = entry.width as usize;
+		let clr_len = entry.height as usize * clr_stride;
 
-				let out_rgb_line = &mut new_out[mkrange(y * out_stride, out_stride)];
+		for y in 0..(entry.height as usize) {
+			let curr_line_offset = y * clr_stride;
 
-				let r_range = mkrange(curr_line_offset, clr_stride);
-				let g_range = mkrange(curr_line_offset + clr_len, clr_stride);
-				let b_range = mkrange(curr_line_offset + clr_len * 2, clr_stride);
-
-				let r_line = &out_buf[r_range];
-				let g_line = &out_buf[g_range];
-				let b_line = &out_buf[b_range];
-
-				for x in (0..out_stride).step_by(3) {
-					let x_idx = x / 3;
-					out_rgb_line[ x     ] = r_line[x_idx];
-					out_rgb_line[ x + 1 ] = g_line[x_idx];
-					out_rgb_line[ x + 2 ] = b_line[x_idx];
-				}
+			fn mkrange(start: usize, len: usize) -> std::ops::Range<usize> {
+				start..(start + len)
 			}
 
-			new_out
-		} else {
-			// TODO: apply palette colour?
-			out_buf
-		};
+			let out_rgb_line = &mut new_out[mkrange(y * out_stride, out_stride)];
 
-		let row_size = entry.width as usize * out_depth as usize;
-		for i in 0..(entry.height / 2) as usize {
-			for j in 0..(entry.width * out_depth) as usize {
-				let row_idx = (entry.height as usize - i - 1) * row_size + j;
-				let col_idx = i * row_size + j;
+			let r_range = mkrange(curr_line_offset, clr_stride);
+			let g_range = mkrange(curr_line_offset + clr_len, clr_stride);
+			let b_range = mkrange(curr_line_offset + clr_len * 2, clr_stride);
 
-				let a = out_buf[row_idx];
-				let b = out_buf[col_idx];
-				out_buf[row_idx] = b;
-				out_buf[col_idx] = a;
+			let r_line = &out_buf[r_range];
+			let g_line = &out_buf[g_range];
+			let b_line = &out_buf[b_range];
+
+			for x in (0..out_stride).step_by(3) {
+				let x_idx = x / 3;
+				out_rgb_line[x] = r_line[x_idx];
+				out_rgb_line[x + 1] = g_line[x_idx];
+				out_rgb_line[x + 2] = b_line[x_idx];
 			}
 		}
 
-		let (file_size, bmp_offset, imgdata_size) = if header.depth == 8 {
-			(0x436 + out_buf.len(), 0x436, 0x400 + out_buf.len())
-		} else {
-			(0x36 + out_buf.len(), 0x36, out_buf.len())
-		};
+		new_out
+	} else {
+		out_buf
+	};
 
-		let bmp_header = BMPHeader {
-			magic: ['B' as u8, 'M' as u8],
-			filesz: file_size as u32,
-			res1: 0,
-			res2: 0,
-			offset: bmp_offset,
-		};
+	let row_size = entry.width as usize * out_depth as usize;
+	let out_buf_iterator = out_buf.rchunks_exact(row_size);
 
-		let bmp_dib_header = BMPDibV3Header {
-			header_sz: 0x28,
-			width: entry.width,
-			height: entry.height,
-			nplanes: 1,
-			bmp_bytesz: imgdata_size as u32,
-			depth: header.depth,
-			compress_type: 0,
-			hres: 0,
-			vres: 0,
-			ncolors: 0,
-			nimpcolors: 0,
-		};
+	let (file_size, bmp_offset, imgdata_size) = if header.depth == 8 {
+		(0x436 + out_buf.len(), 0x436, 0x400 + out_buf.len())
+	} else {
+		(0x36 + out_buf.len(), 0x36, out_buf.len())
+	};
 
-		let hdr_bytes = to_bytes(&bmp_header);
-		let dib_bytes = to_bytes(&bmp_dib_header);
-		let mut res = Vec::with_capacity(hdr_bytes.len() + dib_bytes.len() + palette.len() + out_buf.len());
+	let bmp_header = BMPHeader {
+		magic: ['B' as u8, 'M' as u8],
+		filesz: file_size as u32,
+		res1: 0,
+		res2: 0,
+		offset: bmp_offset,
+	};
 
-		res.extend_from_slice(&hdr_bytes);
-		res.extend_from_slice(&dib_bytes);
-		res.extend_from_slice(&palette);
-		res.extend_from_slice(&out_buf);
+	let bmp_dib_header = BMPDibV3Header {
+		header_sz: 0x28,
+		width: entry.width,
+		height: entry.height,
+		nplanes: 1,
+		bmp_bytesz: imgdata_size as u32,
+		depth: header.depth,
+		compress_type: 0,
+		hres: 0,
+		vres: 0,
+		ncolors: 0,
+		nimpcolors: 0,
+	};
 
-		std::fs::write(&out_file, &res)?;
+	let hdr_bytes = to_bytes(&bmp_header);
+	let dib_bytes = to_bytes(&bmp_dib_header);
+	let mut res = Vec::with_capacity(hdr_bytes.len() + dib_bytes.len() + palette.len() + out_buf.len());
+	
+	res.extend(hdr_bytes);
+	res.extend(dib_bytes);
+	res.extend(palette);
+	
+	for chunk in out_buf_iterator {
+		res.extend(chunk);
 	}
 
+	std::fs::write(&out_file, &res)?;
 	Ok(())
 }
 

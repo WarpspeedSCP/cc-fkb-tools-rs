@@ -222,20 +222,31 @@ pub fn to_bytes<T: Sized>(value: &T) -> &[u8] {
 	}
 }
 
+// A very dumb compression implementation fo LZ77 that will actually *increase* file size, not decrease it.
+pub(crate) fn lz77_compress(input: &[u8]) -> Vec<u8> {
+	(input.len() as u32)
+		.to_le_bytes()
+		.into_iter()
+		.chain(
+			input
+				.chunks(8)
+				.flat_map(|chunk| [0xFF].iter().chain(chunk))
+				.map(|byte| *byte),
+		)
+		.collect()
+}
+
 // unsigned long CrossChannelCrack::unwipf( unsigned char* buff,      // 输入文件正文的array
 // 										 unsigned long  len,       // 输入文件长度
 // 										 unsigned char* out_buff,  // 输出文件正文的array
 // 										 unsigned long  out_len )  // 输出文件长度
 // {
-pub fn unwipf(input: &[u8], out_len: usize) -> Vec<u8> {
+pub fn lz77_decompress(input: &[u8], out_len: usize) -> Vec<u8> {
 	let mut buff = 0usize;
-
-	// 	unsigned long  ring_len   = 4096;                        // 寻址范围就是0-4095
-	// 	unsigned char* ring       = new unsigned char[ring_len]; // 剪贴板
+	
 	let mut ring = [0u8; 4096];
-	// //	unsigned long ring_index  = 0xFEE;                       // 剪贴板的索引
-	// 	unsigned long  ring_index = 1;                           // 剪贴板的索引
-	let mut ring_index = 0x1usize;//0xFEEusize;
+	
+	let mut ring_index = 0x1usize;
 	// 	unsigned char* end        = buff + len;                  // 指向输入array的末尾
 	let end = input.len();
 
