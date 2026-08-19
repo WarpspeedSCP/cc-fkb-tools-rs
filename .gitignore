@@ -1,3 +1,4 @@
 /target
-/unpacked_arcs
-/extracted_arcs
+/unpacked_arcs*
+/extracted_arcs*
+**/*.arc
