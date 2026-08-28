@@ -188,13 +188,13 @@ pub fn tl_transform_script(input: &Script) -> String {
 	lines.join("")
 }
 
-fn is_hex_digit_a(c: char) -> bool {
-	c.is_digit(16) || c == 'x'
+pub fn is_digit_a(c: char) -> bool {
+	c.is_digit(10)
 }
 
 pub fn hex_int(input: &str) -> IResult<&str, u32> {
-	map_res(take_while(is_hex_digit_a), |it: &str| {
-		u32::from_str_radix(it.trim_start_matches("0x"), 16)
+	map_res(take_while(is_digit_a), |it: &str| {
+		u32::from_str_radix(it, 10)
 	})
 		.parse(input)
 }

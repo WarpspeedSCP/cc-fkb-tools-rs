@@ -1,9 +1,13 @@
+use std::fs::File;
+use std::ops::Deref;
 use std::path::PathBuf;
 use crate::opcodes::{make_opcode, Script};
-use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress};
+use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress, lz77_compress};
 use camino::{Utf8Path as Utf8Path, Utf8PathBuf};
 use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
+use regex::Regex;
+use crate::data::text_script::hex_int;
 
 pub mod text_script;
 
@@ -44,6 +48,39 @@ pub struct BMPHeader {
 	offset: u32,
 }
 
+impl BMPHeader {
+	pub fn new(filesz: u32, offset: u32) -> Self {
+		BMPHeader {
+			magic: ['B' as u8, 'M' as u8],
+			filesz,
+			res1: 0,
+			res2: 0,
+			offset,
+		}
+	}
+}
+
+impl From<&[u8]> for BMPHeader
+{
+	fn from(slice: &[u8]) -> Self {
+		if slice.len() < size_of::<Self>() {
+			panic!("bad input slice for bitmap header!");
+		}
+
+		unsafe {
+			let data = slice[..14].as_ptr();
+			let out: *const BMPHeader = std::mem::transmute(data as *const BMPHeader);
+			BMPHeader {
+				magic: *b"BM",
+				filesz: (*out).filesz,
+				res1: 0,
+				res2: 0,
+				offset: (*out).offset,
+			}
+		}
+	}
+}
+
 #[repr(C, packed)]
 pub struct BMPDibV3Header {
 	header_sz: u32,
@@ -59,7 +96,35 @@ pub struct BMPDibV3Header {
 	nimpcolors: u32,
 }
 
+impl From<&[u8]> for BMPDibV3Header {
+	fn from(slice: &[u8]) -> Self {
+		if slice.len() < size_of::<Self>() {
+			panic!("bad input slice for bitmap DIB header!");
+		}
+
+		unsafe {
+			let data = slice[..40].as_ptr();
+			let out: &BMPDibV3Header = &*(std::mem::transmute::<_, *const BMPDibV3Header>(data as *const BMPDibV3Header));
+			let val = &*out;
+			BMPDibV3Header {
+				header_sz: size_of::<BMPDibV3Header>() as u32,
+				width: out.width,
+				height: out.height,
+				nplanes: out.nplanes,
+				depth: out.depth,
+				compress_type: out.compress_type,
+				bmp_bytesz: out.bmp_bytesz,
+				hres: out.hres,
+				vres: out.vres,
+				ncolors: out.ncolors,
+				nimpcolors: out.nimpcolors,
+			}
+		}
+	}
+}
+
 #[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
 pub struct WIPFENTRY {
 	width: u32,     // unsigned long  width;    // ����
 	height: u32,    // unsigned long  height;   // �߶�
@@ -70,6 +135,18 @@ pub struct WIPFENTRY {
 }
 
 impl WIPFENTRY {
+
+	fn new(width: u32, height: u32, x_offset: u32, y_offset: u32, length: u32) -> Self {
+		WIPFENTRY {
+			width,
+			height,
+			x_offset,
+			y_offset,
+			unk_layer: 0u32,
+			length,
+		}
+	}
+
 	fn from_ref(slice: &[u8]) -> &Self {
 		if slice.len() < size_of::<Self>() {
 			panic!("bad input slice for wipfentry!");
@@ -93,18 +170,30 @@ impl WIPFENTRY {
 	}
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct ExtensionDescriptor {
 	pub name: String,
 	pub number: u32,
 	pub offset: u32,
 }
 
+impl ExtensionDescriptor {
+	pub fn size(&self) -> usize {
+		(encode_sjis(&self.name).len() + 1) + 4 + 4
+	}
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileDescriptor {
 	pub name: String,
-	pub size: usize,
-	pub offset: usize,
+	pub size: u32,
+	pub offset: u32,
+}
+
+impl FileDescriptor {
+	pub fn size(&self) -> usize {
+		(encode_sjis(&self.name).len() + 1) + 4 + 4
+	}
 }
 
 pub fn fix_yaml_str(it: String) -> String {
@@ -171,8 +260,8 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 			files.push(
 				FileDescriptor {
 					name: file_name,
-					size: size as usize,
-					offset: offset as usize,
+					size,
+					offset,
 				}
 			);
 		}
@@ -181,17 +270,17 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 	let mut contents = vec![];
 	let first_offset = files.first().unwrap().offset;
 	let mut curr_offset = first_offset;
-	let (_, mut input) = input.split_at_mut(first_offset);
+	let (_, mut input) = input.split_at_mut(first_offset as usize);
 	for (filename, desc) in filenames.iter().zip(&files) {
 		log::info!("Processing {filename}");
 
 		let output_file_path = out_folder.join(filename.as_str());
 		if curr_offset < desc.offset {
 			let diff = desc.offset - curr_offset;
-			(_, input) = input.split_at_mut(diff);
+			(_, input) = input.split_at_mut(diff as usize);
 		}
 
-		let (content, new_input) = input.split_at_mut(desc.size); // [desc.offset..(desc.offset + desc.size)];
+		let (content, new_input) = input.split_at_mut(desc.size as usize); // [desc.offset..(desc.offset + desc.size)];
 		input = new_input;
 		curr_offset += desc.size;
 
@@ -275,6 +364,102 @@ fn rotate_wsc_for_unpack(input: &mut [u8]) {
 fn rotate_wsc_for_pack(input: &mut [u8]) {
 	for i in input.iter_mut() {
 		*i = i.rotate_left(2);
+	}
+}
+
+fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
+	use nom::branch::alt;
+	use nom::bytes::complete::{tag, take_until, take_while};
+	use nom::combinator::{map_res, value};
+	use nom::multi::{many0, separated_list0};
+	use nom::sequence::{preceded, terminated};
+	use nom::IResult;
+	use nom::{AsChar, Parser};
+
+	let files_to_pack = walkdir::WalkDir::new(input_dir).contents_first(false).into_iter().skip(1).map(|entry| entry.unwrap().into_path()).collect::<Vec<_>>();
+	let depth_is_8 = files_to_pack.get(0).map(|it| Utf8Path::from_path(&it).unwrap().file_name().unwrap().contains("d08")).unwrap_or(false);
+
+	let file_name = input_dir.file_name().unwrap();
+	let header = WIPFHeader::new(files_to_pack.len() as u16, if depth_is_8 { 8 } else { 24 });
+
+	fn parse_file_name<'a>(file_name: &str, input: &'a str) -> IResult<&'a str, (&'a str, u32, u32, u32)> {
+		(terminated(tag(file_name), tag("_")), terminated(hex_int, (tag("-d"), hex_int, tag("+"))), terminated(hex_int, tag("x")), terminated(hex_int, tag("y"))).parse(input)
+	}
+
+	let mut wipf_entries = vec![];
+	let mut wipf_contents = vec![];
+
+	for file in files_to_pack {
+		let path = Utf8Path::from_path(&file).unwrap();
+		let (_, (_, index, x, y)) = parse_file_name(file_name, path.file_name().unwrap()).unwrap();
+
+		let bmp = std::fs::read(file)?;
+
+		let dib_header = BMPDibV3Header::from(&bmp[14..(14 + 40)]);
+
+		let entry = WIPFENTRY::new(dib_header.width, dib_header.height, x, y, dib_header.width * dib_header.height * (header.depth / 8) as u32);
+		wipf_entries.push(entry);
+
+		let entry_data = &bmp[(14 + 40)..];
+
+		let compression_data = if depth_is_8 { &entry_data[0x400..] } else { entry_data };
+
+		let row_size = ((entry.width * (header.depth / 8) as u32)).next_multiple_of(4);
+
+		let entry_data_flip_iter = compression_data.rchunks_exact(row_size as usize);
+		let entry_out_buffer = if !depth_is_8 {
+			let colour_stride = entry.width;
+			let colour_width = colour_stride * entry.height;
+			let mut entry_out_buffer = vec![0u8; entry_data.len()];
+
+			for (row_index, rgb_row) in entry_data_flip_iter.enumerate() {
+				let (_, out_row) = entry_out_buffer.split_at_mut(row_index * entry.width as usize);
+
+				let (r_line_out, rest) = out_row.split_at_mut(colour_stride as usize);
+				let (g_line_out, rest) = rest.split_at_mut(colour_width as usize);
+				let (b_line_out, rest) = rest.split_at_mut(colour_width as usize);
+
+				let (data, row_rest) = rgb_row.as_chunks();
+				for (index, &[r, g, b]) in data.iter().enumerate() {
+					r_line_out[index] = r;
+					g_line_out[index] = g;
+					b_line_out[index] = b;
+				}
+			}
+			lz77_compress(&entry_out_buffer)
+		} else {
+			lz77_compress(compression_data)
+		};
+
+		let entry_final_data = if depth_is_8 {
+			(0..0xFF).flat_map(|it| [it, it, it, 0]).chain(entry_out_buffer).collect()
+		} else {
+			entry_out_buffer
+		};
+
+		wipf_contents.extend(entry_final_data);
+	}
+
+
+	let mut out_bytes = vec![];
+	out_bytes.extend_from_slice(to_bytes(&header));
+	for entry in wipf_entries {
+		out_bytes.extend_from_slice(to_bytes(&entry));
+	}
+	out_bytes.extend(wipf_contents);
+
+	Ok(out_bytes)
+}
+
+#[cfg(test)]
+mod test {
+	use camino::Utf8PathBuf;
+	use crate::data::do_pack_wipf;
+
+	#[test]
+	fn main() {
+		let input = Utf8PathBuf::from("/home/wscp/RustroverProjects/cc-fkb-tools-rs/extracted_arcs_old/Chip.arc/BGM_P1G.WIP");
+		std::fs::write("/home/wscp/RustroverProjects/cc-fkb-tools-rs/extracted_arcs/Chip.arc/BGM_P1G.WIP.new", do_pack_wipf(&input).unwrap()).unwrap();
 	}
 }
 
