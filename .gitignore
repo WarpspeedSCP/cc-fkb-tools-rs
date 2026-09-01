@@ -2,3 +2,4 @@
 /unpacked_arcs*
 /extracted_arcs*
 **/*.arc
+**/*.c
