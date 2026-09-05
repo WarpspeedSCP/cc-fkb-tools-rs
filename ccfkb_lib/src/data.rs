@@ -192,7 +192,7 @@ pub struct FileDescriptor {
 
 impl FileDescriptor {
 	pub fn size(&self) -> usize {
-		(encode_sjis(&self.name).len() + 1) + 4 + 4
+		(encode_sjis(&self.name[..13]).len() + 1) + 4 + 4
 	}
 }
 
@@ -338,7 +338,7 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 		output.extend(sjis_name);
 		let mut contents = std::fs::read(&curr_path).unwrap();
 
-		if curr_path.file_name().map(|it| it.ends_with("WSC")).unwrap_or_default() {
+		if curr_path.file_name().map(|it| it.to_ascii_uppercase().ends_with("WSC")).unwrap_or_default() {
 			rotate_wsc_for_pack(&mut contents)
 		}
 

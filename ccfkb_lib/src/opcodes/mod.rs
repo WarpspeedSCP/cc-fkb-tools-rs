@@ -39,7 +39,8 @@ pub enum OpField {
 		u32),
 	String(TLString),
 	Choice(Vec<Choice>),
-	Padding(u8),
+	#[serde(serialize_with = "crate::opcodes::serialize_inline_ints_vec")]
+	Padding(Vec<u8>),
 }
 
 impl OpField {
@@ -76,7 +77,7 @@ impl OpField {
 				}
 				acc
 			}
-			OpField::Padding(size) => *size as usize
+			OpField::Padding(contents) => contents.len()
 		}
 	}
 
@@ -93,7 +94,7 @@ impl OpField {
 					buf.extend(choice.binary_serialise());
 				}
 			}
-			OpField::Padding(number) => buf.extend(vec![0; *number as usize]),
+			OpField::Padding(contents) => buf.extend_from_slice(contents),
 		};
 
 		buf
@@ -130,6 +131,7 @@ impl Choice {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Opcode {
+	pub name: String,
 	#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
 	pub opcode: u8,
 	#[serde(serialize_with = "crate::opcodes::serialize_hex_usize")]
@@ -362,6 +364,7 @@ fn make_choice(input: &[u8]) -> Choice {
 pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 	let mut ptr = 1usize;
 	let mut fields = vec![];
+	let mut name: &'static str;
 
 	macro_rules! expand_opcode_component {
         (c) => {
@@ -412,13 +415,18 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
         };
         (p) => {
             {
-                fields.push(OpField::Padding(1));
+				if let Some(OpField::Padding(contents)) = fields.last_mut() {
+					contents.push(input[ptr]);
+				} else {
+					fields.push(OpField::Padding(vec![input[ptr]]));
+				}
+                // fields.push(OpField::Padding(1));
                 ptr += 1;
             }
         };
     }
 
-	macro_rules! expand_opcode {
+	macro_rules! expand_opcode_inner {
         () => {
             {
 
@@ -427,166 +435,212 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
         (c, $($tail:tt)*) => {
                 expand_opcode_component!(c);
 
-                expand_opcode!($($tail)*)
+                expand_opcode_inner!($($tail)*)
         };
         (s, $($tail:tt)*) => {
                 expand_opcode_component!(s);
 
-                expand_opcode!($($tail)*)
+                expand_opcode_inner!($($tail)*)
         };
         (b, $($tail:tt)*) => {
                 expand_opcode_component!(b);
 
-                expand_opcode!($($tail)*)
+                expand_opcode_inner!($($tail)*)
         };
         (w, $($tail:tt)*) => {
                 expand_opcode_component!(w);
 
-                expand_opcode!($($tail)*)
+                expand_opcode_inner!($($tail)*)
         };
         (d, $($tail:tt)*) => {
                 expand_opcode_component!(d);
 
-                expand_opcode!($($tail)*)
+                expand_opcode_inner!($($tail)*)
         };
         (p, $($tail:tt)*) => {
                 expand_opcode_component!(p);
 
-                expand_opcode!($($tail)*)
+                expand_opcode_inner!($($tail)*)
+        };
+    }
+	
+	macro_rules! expand_opcode {
+        ($name: expr) => {
+			{
+				name = $name;
+			}
+        };
+        ($name: expr, c, $($tail:tt)*) => {
+            name = $name;
+
+			expand_opcode_component!(c);
+
+            expand_opcode_inner!($($tail)*)
+        };
+        ($name: expr, s, $($tail:tt)*) => {
+			name = $name;
+
+            expand_opcode_component!(s);
+
+            expand_opcode_inner!($($tail)*)
+        };
+        ($name: expr, b, $($tail:tt)*) => {
+        	name = $name;
+
+		    expand_opcode_component!(b);
+
+            expand_opcode_inner!($($tail)*)
+        };
+        ($name: expr, w, $($tail:tt)*) => {
+    		name = $name;
+
+	        expand_opcode_component!(w);
+
+            expand_opcode_inner!($($tail)*)
+        };
+        ($name: expr, d, $($tail:tt)*) => {
+            name = $name;
+
+			expand_opcode_component!(d);
+
+            expand_opcode_inner!($($tail)*)
+        };
+        ($name: expr, p, $($tail:tt)*) => {
+    		name = $name;
+
+	        expand_opcode_component!(p);
+
+            expand_opcode_inner!($($tail)*)
         };
     }
 
 	match &input[0] {
-		0x01 => {
-			expand_opcode!(b, w, w, d, p,);
-		} // n_byte_opcode(input, 11), // : 11 bytes (1 + 1 + 2 + 2 + 4 + 1)
-		0x02 => { expand_opcode!(b, p, c,); } // 0x02: Variable (minimum 4 bytes + choice data)
-		0x03 => { expand_opcode!(b, w, b, w, p,); } // n_byte_opcode(input, 8), // : 8 bytes (1 + 1 + 2 + 1 + 2 + 1)
-		0x04 => expand_opcode!(), // n_byte_opcode(input, 1), // 0x04: 1 byte
-		0x05 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x06 => { expand_opcode!(d, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 2)
-		0x07 => { expand_opcode!(w, s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0x08 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes
-		0x09 => { expand_opcode!(s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0x0A => { expand_opcode!(p,); } // n_byte_opcode(input, 1), //: 1 byte
-		0x0B => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x0C => { expand_opcode!(w, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 2 + 1)
-		0x0D => { expand_opcode!(w, w, w, p,); } // n_byte_opcode(input, 10), //: 10 bytes (1 + 2 + 2 + 4 + 1)
-		0x0E => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x21 => { expand_opcode!(b, w, b, w, d, s,); } // make_string_opcode(12, input), //: Variable (minimum 13 bytes + string length)
-		0x22 => { expand_opcode!(b, w, p,); } // n_byte_opcode(input, 5), //: 5 bytes (1 + 1 + 2 + 1)
-		0x23 | 0x27 => { expand_opcode!(b, w, w, w, b, b, s,); } // make_string_opcode(10, input), // 0x27: Variable (minimum 11 bytes + string length)
-		0x24 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x25 => { expand_opcode!(b, b, w, p, p, b, w, b, s,); } // make_string_opcode(12, input), //: Variable (minimum 13 bytes + string length)
-		0x26 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x28 => { expand_opcode!(b, b, p, p, p,); } // n_byte_opcode(input, 6), //: 6 bytes (1 + 1 + 1 + 3)
-		0x29 => { expand_opcode!(b, w, p, p,); } // n_byte_opcode(input, 6), //: 6 bytes (1 + 1 + 2 + 2)
-		0x30 => { expand_opcode!(b, p, p, p,); } // n_byte_opcode(input, 5), //: 5 bytes (1 + 1 + 3)
-		0x31 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x32 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x33 => { expand_opcode!(w, w, w, p,); } // n_byte_opcode(input, 8), //: 8 bytes (1 + 2 + 2 + 2 + 1)
-		0x34 => { expand_opcode!(w, b, b, s,); } // make_string_opcode(6, input), //: Variable (minimum 7 bytes + string length)
-		0x41 => { expand_opcode!(w, b, b, s,); } // make_string_opcode(5, input), //: Variable (minimum 6 bytes + string length)
-		0x42 => { expand_opcode!(w, b, b, b, s, s,); } // make_n_string_opcode(6, 2, input), //: Variable (minimum 7 bytes + 2 string lengths)
-		0x43 => { expand_opcode!(b, w, w, b, s,); } // make_string_opcode(7, input), //: Variable (minimum 8 bytes + string length)
-		0x44 => { expand_opcode!(b, b, b, p,); } // n_byte_opcode(input, 5), //: 5 bytes (1 + 1 + 1 + 1 + 1)
-		0x45 => { expand_opcode!(b, b, b, p,); } // n_byte_opcode(input, 5), //: 5 bytes (1 + 1 + 1 + 1 + 1)
-		0x46 => { expand_opcode!(w, w, p, p, p, b, b, s,); } // make_string_opcode(10, input), //: Variable (minimum 11 bytes + string length)
-		0x47 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x48 => { expand_opcode!(b, w, w, d, b, b, s,); } // n_byte_opcode(input, 13), //: 13 bytes (1 + 11 + 1)
-		0x49 => { expand_opcode!(w, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 2 + 1)
-		0x4A => { expand_opcode!(b, w, w, p,); } // n_byte_opcode(input, 8), //: 8 bytes (1 + 1 + 2 + 2 + 1)
-		0x4B => { expand_opcode!(b, w, w, d, w, d, d, p,); } // n_byte_opcode(input, 24), //: 24 bytes (1 + 1 + 2 + 2 + 4 + 2 + 4 + 4 + 1)
-		0x4C => { expand_opcode!(b, b, d, p, p,); } // n_byte_opcode(input, 9), //: 9 bytes (1 + 1 + 1 + 4 + 1 + 1)
-		0x4D => { expand_opcode!(b, b, w, w, w, w, w, p,); } // n_byte_opcode(input, 15), //: 15 bytes (1 + 1 + 1 + 2 + 2 + 2 + 2 + 2 + 1)
-		0x4E => { expand_opcode!(b, b, b, p,); } // n_byte_opcode(input, 5), //: 5 bytes (1 + 1 + 1 + 1 + 1)
-		0x4F => { expand_opcode!(b, b, b, p,); } // n_byte_opcode(input, 5), //: 5 bytes (1 + 1 + 1 + 1 + 1)
-		0x50 => { expand_opcode!(s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0x51 => { expand_opcode!(w, w, p,); } // n_byte_opcode(input, 6), //: 6 bytes (1 + 2 + 2 + 1)
-		0x52 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x53 => { expand_opcode!(b, w, w, s,); } // make_string_opcode(6, input), //: Variable (minimum 7 bytes + string length)
-		0x54 => { expand_opcode!(s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0x55 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x56 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x57 => { expand_opcode!(w, w, d, p,); } // n_byte_opcode(input, 10), //: 10 bytes (1 + 2 + 2 + 4 + 1)
-		0x58 => { expand_opcode!(b, b, b, w, w, p,); } // n_byte_opcode(input, 10), //: 10 bytes (1 + 1 + 1 + 1 + 2 + 2 + 1)
-		0x59 => { expand_opcode!(s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0x60 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x61 => { expand_opcode!(b, s,); } // make_string_opcode(2, input), //: Variable (minimum 3 bytes + string length)
-		0x62 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x63 => { expand_opcode!(b, b, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 1 + 1 + 1)
-		0x64 => { expand_opcode!(b, w, w, w, p,); } // n_byte_opcode(input, 9), //: 9 bytes (1 + 1 + 2 + 2 + 2 + 1)
-		0x65 => { expand_opcode!(w, w, p,); } // n_byte_opcode(input, 6), //: 6 bytes (1 + 2 + 2 + 1)
-		0x66 => { expand_opcode!(b, w, w, b, w, d, w, d, d,); } // n_byte_opcode(input, 24), //: 24 bytes (1 + 1 + 2 + 2 + 1 + 2 + 4 + 2 + 4 + 4)
-		0x67 => { expand_opcode!(b, b, p, d, p,); } // n_byte_opcode(input, 9), //: 9 bytes (1 + 1 + 1 + 1 + 4 + 1)
-		0x68 => { expand_opcode!(w, w, w, w, p,); } // n_byte_opcode(input, 10), //: 10 bytes (1 + 2 + 2 + 2 + 2 + 1)
-		0x69 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x70 => { expand_opcode!(b, b, p, d, p,); } // n_byte_opcode(input, 9), //: 9 bytes (1 + 1 + 1 + 1 + 4 + 1)
-		0x71 => { expand_opcode!(s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0x72 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x73 => { expand_opcode!(w, w, d, b, s,); } // make_string_opcode(9, input), //: Variable (minimum 10 bytes + string length)
-		0x74 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x75 => { expand_opcode!(w, w, w, w, p,); } // n_byte_opcode(input, 10), //: 10 bytes (1 + 2 + 2 + 2 + 2 + 1)
-		0x76 => { expand_opcode!(w, w, d, b, b, w, d, p,); } // n_byte_opcode(input, 18), //: 18 bytes (1 + 2 + 2 + 4 + 1 + 1 + 2 + 4 + 1)
-		0x77 => { expand_opcode!(w, w, d, p,); } // n_byte_opcode(input, 10), //: 10 bytes (1 + 2 + 2 + 4 + 1)
-		0x78 => { expand_opcode!(b, b, b, d, p,); } // n_byte_opcode(input, 9), //: 9 bytes (1 + 1 + 1 + 1 + 4 + 1)
-		0x79 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x81 => { expand_opcode!(p, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x82 => { expand_opcode!(w, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 2 + 1)
-		0x83 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x84 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x85 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x86 => { expand_opcode!(p, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0x87 => { expand_opcode!(w, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 2 + 1)
-		0x88 => { expand_opcode!(p, p, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 1 + 1 + 1)
-		0x89 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x8A => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x8B => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x8C => { expand_opcode!(w, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 2 + 1)
-		0x8D => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0x8E => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xA0 => { expand_opcode!(w, w, b, p,); } // n_byte_opcode(input, 7), //: 7 bytes (1 + 2 + 2 + 1 + 1)
-		0xA1 => { expand_opcode!(b, w, w, b, p,); } // n_byte_opcode(input, 9), //: 9 bytes (1 + 1 + 2 + 2 + 1 + 1)
-		0xA2 => { expand_opcode!(b, w, w, p,); } // n_byte_opcode(input, 8), //: 8 bytes (1 + 1 + 2 + 2 + 1)
-		0xA3 => { expand_opcode!(p, w, w, p,); } // n_byte_opcode(input, 7), //: 7 bytes (1 + 1 + 2 + 2 + 1)
-		0xA4 => { expand_opcode!(p, w, w, p,); } // n_byte_opcode(input, 7), //: 7 bytes (1 + 1 + 2 + 2 + 1)
-		0xA5 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0xA6 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xA7 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xA8 => { expand_opcode!(b, b, b, p, p, p, p, w, w, w, w, p,); } // n_byte_opcode(input, 19), //: 19 bytes (1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 2 + 2 + 2 + 1)
-		0xA9 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xAA => { expand_opcode!(b, b, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 1 + 1 + 1)
-		0xAB => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xAC => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xAD => { expand_opcode!(b, d, d, p,); } // n_byte_opcode(input, 11), //: 11 bytes (1 + 1 + 4 + 4 + 1)
-		0xAE => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xB1 => { expand_opcode!(w, w, p,); } // n_byte_opcode(input, 6), //: 6 bytes (1 + 2 + 2 + 1)
-		0xB2 => { expand_opcode!(b, p, s,); } // make_string_opcode(3, input), //: Variable (minimum 4 bytes + string length)
-		0xB3 => { expand_opcode!(p, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0xB4 => { expand_opcode!(p, p, w, w, d, b, p,); } // n_byte_opcode(input, 14), //: 14 bytes (1 + 1 + 1 + 2 + 2 + 4 + 1 + 1)
-		0xB5 => { expand_opcode!(b, b, p, p, p, p, p,); } // n_byte_opcode(input, 8), //: 8 bytes (1 + 1 + 1 + 1 + 1 + 1 + 1 + 1)
-		0xB6 => { expand_opcode!(w, s,); } // make_string_opcode(3, input), //: Variable (minimum 4 bytes + string length)
-		0xB7 => { expand_opcode!(b, w, w, s,); } // make_string_opcode(6, input), //: Variable (minimum 7 bytes + string length)
-		0xB8 => { expand_opcode!(b, b, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 1 + 1 + 1)
-		0xB9 => { expand_opcode!(b, b, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 1 + 1 + 1)
-		0xBA => { expand_opcode!(w, w, b, b, b, b, b, w, s,); } // make_string_opcode(12, input), //: Variable (minimum 13 bytes + string length)
-		0xBB => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xBC => { expand_opcode!(b, b, b, p,); } // n_byte_opcode(input, 5), //: 5 bytes (1 + 1 + 1 + 1 + 1)
-		0xBD => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0xBE => { expand_opcode!(b, b, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 1 + 1 + 1)
-		0xBF => { expand_opcode!(b, b, b, w, p,); } // n_byte_opcode(input, 7), //: 7 bytes (1 + 1 + 1 + 1 + 2 + 1)
-		0xE0 => { expand_opcode!(s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0xE2 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xE3 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xE4 => { expand_opcode!(b, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0xE5 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xE6 => { expand_opcode!(p, p,); } // n_byte_opcode(input, 3), //: 3 bytes (1 + 1 + 1)
-		0xE7 => { expand_opcode!(w, p,); } // n_byte_opcode(input, 4), //: 4 bytes (1 + 2 + 1)
-		0xE8 => { expand_opcode!(s,); } // make_string_opcode(1, input), //: Variable (minimum 2 bytes + string length)
-		0xE9 => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xEA => { expand_opcode!(b, s,); } // make_string_opcode(2, input), //: Variable (minimum 3 bytes + string length)
-		0xEB => { expand_opcode!(p,); } // n_byte_opcode(input, 2), //: 2 bytes (1 + 1)
-		0xFF => expand_opcode!(), // n_byte_opcode(input, 1), //: 1 byte
+		0x01 => { expand_opcode!("UNK", b, w, w, d, p,); } 
+		0x02 => { expand_opcode!("UNK", b, p, c,); } 
+		0x03 => { expand_opcode!("UNK", b, w, b, w, p,); } 
+		0x04 => { expand_opcode!("UNK") }, 
+		0x05 => { expand_opcode!("UNK", b, p,); } 
+		0x06 => { expand_opcode!("UNK", d, p,); } 
+		0x07 => { expand_opcode!("UNK", s,); } 
+		0x08 => { expand_opcode!("UNK", p,); } 
+		0x09 => { expand_opcode!("UNK", s,); } 
+		0x0A => { expand_opcode!("UNK", p,); } 
+		0x0B => { expand_opcode!("UNK", b, p,); } 
+		0x0C => { expand_opcode!("UNK", w, p,); } 
+		0x0D => { expand_opcode!("UNK", w, w, w, p,); } 
+		0x0E => { expand_opcode!("UNK", b, p,); } 
+		0x21 => { expand_opcode!("UNK", b, w, b, w, d, s,); } 
+		0x22 => { expand_opcode!("UNK", b, w, p,); } 
+ 0x23 | 0x27 => { expand_opcode!("UNK", b, w, w, w, b, b, s,); } 
+		0x24 => { expand_opcode!("UNK", p,); } 
+		0x25 => { expand_opcode!("UNK", b, b, w, p, p, b, w, b, b, s,); } 
+		0x26 => { expand_opcode!("UNK", b, p,); } 
+		0x28 => { expand_opcode!("UNK", b, b, w, p,); } 
+		0x29 => { expand_opcode!("UNK", b, w, p,); } 
+		0x30 => { expand_opcode!("UNK", b, w, p,); } 
+		0x31 => { expand_opcode!("UNK", b, p,); } 
+		0x32 => { expand_opcode!("UNK", b, p,); } 
+		0x33 => { expand_opcode!("UNK", w, w, w, p,); } 
+		0x41 => { expand_opcode!("UNK", w, b, b, s,); } 
+		0x42 => { expand_opcode!("UNK", w, b, b, b, s, s,); } 
+		0x43 => { expand_opcode!("UNK", b, w, w, b, s,); } 
+		0x44 => { expand_opcode!("UNK", b, b, b, p,); } 
+		0x45 => { expand_opcode!("UNK", b, b, b, p,); } 
+		0x46 => { expand_opcode!("UNK", w, w, d, b, s,); } 
+		0x47 => { expand_opcode!("UNK", b, p,); } 
+		0x48 => { expand_opcode!("UNK", b, w, w, d, b, b, s,); } 
+		0x49 => { expand_opcode!("UNK", w, p,); } 
+		0x4A => { expand_opcode!("UNK", b, w, w, p,); } 
+		0x4B => { expand_opcode!("UNK", b, w, w, d, w, d, d, p,); } 
+		0x4C => { expand_opcode!("UNK", b, b, b, d, p,); } 
+		0x4D => { expand_opcode!("UNK", b, b, w, w, w, w, w, p,); } 
+		0x4E => { expand_opcode!("UNK", b, b, b, p,); } 
+		0x4F => { expand_opcode!("UNK", b, b, b, p,); } 
+		0x50 => { expand_opcode!("UNK", s,); } 
+		0x51 => { expand_opcode!("UNK", w, w, p,); } 
+		0x52 => { expand_opcode!("UNK", b, p,); } 
+		0x54 => { expand_opcode!("UNK", s,); } 
+		0x55 => { expand_opcode!("UNK", p,); } 
+		0x56 => { expand_opcode!("UNK", p,); } 
+		0x57 => { expand_opcode!("UNK", w, w, d, p,); } 
+		0x58 => { expand_opcode!("UNK", b, b, b, w, w, p,); } 
+		0x59 => { expand_opcode!("UNK", s,); } 
+		0x60 => { expand_opcode!("UNK", p,); } 
+		0x61 => { expand_opcode!("UNK", b, s,); } 
+		0x62 => { expand_opcode!("UNK", p,); } 
+		0x63 => { expand_opcode!("UNK", b, b, p,); } 
+		0x64 => { expand_opcode!("UNK", b, w, w, w, p,); } 
+		0x65 => { expand_opcode!("UNK", w, w, p,); } 
+		0x66 => { expand_opcode!("UNK", b, w, w, b, w, d, w, d, d,); } 
+		0x67 => { expand_opcode!("UNK", b, b, b, d, p,); } 
+		0x68 => { expand_opcode!("UNK", w, w, w, w, p,); } 
+		0x69 => { expand_opcode!("UNK", b, p,); } 
+		0x70 => { expand_opcode!("UNK", b, b, p, d, p,); } 
+		0x71 => { expand_opcode!("UNK", s,); } 
+		0x72 => { expand_opcode!("UNK", p,); } 
+		0x73 => { expand_opcode!("UNK", w, w, d, b, s,); } 
+		0x74 => { expand_opcode!("UNK", b, p,); } 
+		0x75 => { expand_opcode!("UNK", w, w, w, w, p,); } 
+		0x76 => { expand_opcode!("UNK", w, w, d, b, b, w, d, p,); } 
+		0x77 => { expand_opcode!("UNK", w, w, d, p,); } 
+		0x78 => { expand_opcode!("UNK", b, b, b, d, p,); } 
+		0x79 => { expand_opcode!("UNK", p,); } 
+		0x81 => { expand_opcode!("UNK", p, p,); } 
+		0x82 => { expand_opcode!("UNK", w, p,); } 
+		0x83 => { expand_opcode!("UNK", p,); } 
+		0x84 => { expand_opcode!("UNK", p,); } 
+		0x85 => { expand_opcode!("UNK", b, p,); } 
+		0x86 => { expand_opcode!("UNK", p, p,); } 
+		0x87 => { expand_opcode!("UNK", w, p,); } 
+		0x88 => { expand_opcode!("UNK", p, p, p,); } 
+		0x89 => { expand_opcode!("UNK", p,); } 
+		0x8A => { expand_opcode!("UNK", p,); } 
+		0x8B => { expand_opcode!("UNK", p,); } 
+		0x8C => { expand_opcode!("UNK", w, p,); } 
+		0x8D => { expand_opcode!("UNK", p,); } 
+		0x8E => { expand_opcode!("UNK", p,); } 
+		0xA0 => { expand_opcode!("UNK", w, w, b, p,); } 
+		0xA1 => { expand_opcode!("UNK", b, w, w, b, p,); } 
+		0xA2 => { expand_opcode!("UNK", b, w, w, p,); } 
+		0xA3 => { expand_opcode!("UNK", p, w, w, p,); } 
+		0xA4 => { expand_opcode!("UNK", p, w, w, p,); } 
+		0xA5 => { expand_opcode!("UNK", b, p,); } 
+		0xA6 => { expand_opcode!("UNK", p,); } 
+		0xA7 => { expand_opcode!("UNK", p,); } 
+		0xA8 => { expand_opcode!("UNK", b, b, b, p, p, p, p, w, w, w, w, p,); } 
+		0xA9 => { expand_opcode!("UNK", p,); } 
+		0xAA => { expand_opcode!("UNK", b, b, p,); } 
+		0xAB => { expand_opcode!("UNK", p,); } 
+		0xAC => { expand_opcode!("UNK", p,); } 
+		0xAD => { expand_opcode!("UNK", b, d, d, p,); } 
+		0xAE => { expand_opcode!("UNK", p,); } 
+		0xB1 => { expand_opcode!("UNK", w, w, p,); } 
+		0xB2 => { expand_opcode!("UNK", b, p, s,); } 
+		0xB3 => { expand_opcode!("UNK", p, p,); } 
+		0xB4 => { expand_opcode!("UNK", p, p, w, w, d, b, p,); } 
+		0xB5 => { expand_opcode!("UNK", b, b, p, p, p, p, p,); } 
+		0xB6 => { expand_opcode!("UNK", w, s,); } 
+		0xB7 => { expand_opcode!("UNK", b, w, w, s,); } 
+		0xB8 => { expand_opcode!("UNK", b, b, p,); } 
+		0xB9 => { expand_opcode!("UNK", b, b, p,); } 
+		0xBA => { expand_opcode!("UNK", w, w, b, b, b, b, b, w, s,); } 
+		0xBB => { expand_opcode!("UNK", p,); } 
+		0xBC => { expand_opcode!("UNK", b, b, b, p,); } 
+		0xBD => { expand_opcode!("UNK", b, p,); } 
+		0xBE => { expand_opcode!("UNK", b, b, p,); } 
+		0xBF => { expand_opcode!("UNK", b, b, b, d, p,); } 
+		0xE0 => { expand_opcode!("UNK", s,); } 
+		0xE2 => { expand_opcode!("UNK", p,); } 
+		0xE3 => { expand_opcode!("UNK", p,); } 
+		0xE4 => { expand_opcode!("UNK", b, p,); } 
+		0xE5 => { expand_opcode!("UNK", p,); } 
+		0xE6 => { expand_opcode!("UNK", p, p,); } 
+		0xE7 => { expand_opcode!("UNK", w, p,); } 
+		0xE8 => { expand_opcode!("UNK", s,); } 
+		0xE9 => { expand_opcode!("UNK", p,); } 
+		0xEA => { expand_opcode!("UNK", b, s,); } 
+		0xEB => { expand_opcode!("UNK", p,); } 
+		0xFF => { expand_opcode!("UNK"); } 
 		_ => {
 			log::error!("Unknown opcode 0x{:02X}", &input[0]);
 			return None;
@@ -594,5 +648,11 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 	};
 
 	log::debug!("final pointer value: {ptr}");
-	Some(Opcode { opcode: input[0], address: addr, actual_address: addr, fields })
+	Some(Opcode {
+		name: name.to_owned(),
+		opcode: input[0],
+		address: addr,
+		actual_address: addr,
+		fields
+	})
 }
