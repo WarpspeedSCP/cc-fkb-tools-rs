@@ -224,16 +224,11 @@ pub fn to_bytes<T: Sized>(value: &T) -> &[u8] {
 
 // A very dumb compression implementation fo LZ77 that will actually *increase* file size, not decrease it.
 pub(crate) fn lz77_compress(input: &[u8]) -> Vec<u8> {
-	(input.len() as u32)
-		.to_le_bytes()
-		.into_iter()
-		.chain(
+
 			input
 				.chunks(8)
 				.flat_map(|chunk| [0xFF].iter().chain(chunk))
-				.map(|byte| *byte),
-		)
-		.collect()
+				.map(|byte| *byte).collect()
 }
 
 // unsigned long CrossChannelCrack::unwipf( unsigned char* buff,      // 输入文件正文的array

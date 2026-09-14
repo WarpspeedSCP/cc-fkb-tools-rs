@@ -446,10 +446,15 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 
 	let mut files_to_pack = walkdir::WalkDir::new(input_dir).contents_first(false).into_iter().skip(1).map(|entry| entry.unwrap().into_path()).collect::<Vec<_>>();
 	files_to_pack.sort();
-	let depth_is_8 = files_to_pack.get(0).map(|it| Utf8Path::from_path(&it).unwrap().file_name().unwrap().contains("d08")).unwrap_or(false);
+	let depth = files_to_pack
+		.first()
+		.map(|it| std::fs::read(it).map(|bmp| BMPDibV3Header::from(&bmp[14..(14 + 40)]).depth))
+		.transpose()?
+		.unwrap_or(24);
+	let depth_is_8 = depth == 8;
 
 	let file_name = input_dir.file_name().unwrap();
-	let header = WIPFHeader::new(files_to_pack.len() as u16, if depth_is_8 { 8 } else { 24 });
+	let header = WIPFHeader::new(files_to_pack.len() as u16, depth);
 
 	fn parse_file_name<'a>(file_name: &str, input: &'a str) -> IResult<&'a str, (&'a str, u32, u32, u32)> {
 		(terminated(tag(file_name), tag("_")), terminated(hex_int, (tag("-d"), hex_int, tag("+"))), terminated(hex_int, tag("x")), terminated(hex_int, tag("y"))).parse(input)
@@ -476,22 +481,18 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 
 		let entry_data_flip_iter = compression_data.rchunks_exact(row_size as usize);
 		let entry_out_buffer = if !depth_is_8 {
-			let colour_stride = entry.width;
-			let colour_width = colour_stride * entry.height;
+			let clr_len = entry.width as usize * entry.height as usize;
 			let mut entry_out_buffer = vec![0u8; entry_data.len()];
+			let (r_plane, rest) = entry_out_buffer.split_at_mut(clr_len);
+			let (g_plane, b_plane) = rest.split_at_mut(clr_len);
 
 			for (row_index, rgb_row) in entry_data_flip_iter.enumerate() {
-				let (_, out_row) = entry_out_buffer.split_at_mut(row_index * entry.width as usize);
-
-				let (r_line_out, rest) = out_row.split_at_mut(colour_stride as usize);
-				let (g_line_out, rest) = rest.split_at_mut(colour_width as usize);
-				let (b_line_out, rest) = rest.split_at_mut(colour_width as usize);
-
-				let (data, row_rest) = rgb_row.as_chunks();
+				let base = row_index * entry.width as usize;
+				let (data, _) = rgb_row.as_chunks();
 				for (index, &[r, g, b]) in data.iter().enumerate() {
-					r_line_out[index] = r;
-					g_line_out[index] = g;
-					b_line_out[index] = b;
+					r_plane[base + index] = r;
+					g_plane[base + index] = g;
+					b_plane[base + index] = b;
 				}
 			}
 			lz77_compress(&entry_out_buffer)
@@ -524,13 +525,81 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod test {
-	use camino::Utf8PathBuf;
-	use crate::data::do_pack_wipf;
+	use camino::{Utf8Path, Utf8PathBuf};
+	use crate::data::{do_extract_wipf, do_pack_wipf, WIPFENTRY, WIPFHeader};
+
+	fn compare_dirs(orig_dir: &Utf8Path, new_dir: &Utf8Path) {
+		let mut total = 0usize;
+		let mut mismatches = vec![];
+		let mut missing = vec![];
+		for entry in std::fs::read_dir(orig_dir).unwrap() {
+			let entry = entry.unwrap();
+			if !entry.file_type().unwrap().is_file() { continue; }
+			let name = entry.file_name();
+			let orig = std::fs::read(entry.path()).unwrap();
+			match std::fs::read(new_dir.join(name.to_string_lossy().as_ref())) {
+				Ok(new) => {
+					total += 1;
+					if orig != new {
+						let first_diff = orig.iter().zip(new.iter()).position(|(a, b)| a != b);
+						mismatches.push(format!("{}: orig={} new={} first_diff={:?}", name.to_string_lossy(), orig.len(), new.len(), first_diff));
+					}
+				}
+				Err(_) => missing.push(name.to_string_lossy().to_string()),
+			}
+		}
+		println!("  compared {} files, {} mismatches, {} missing", total, mismatches.len(), missing.len());
+		for m in mismatches.iter().take(10) { println!("    MISMATCH {m}"); }
+		for m in missing.iter().take(10) { println!("    MISSING {m}"); }
+	}
+
+	fn roundtrip_dir(input_dir: &Utf8Path, filename: &str, out_dir: &Utf8Path) {
+		let _ = std::fs::remove_dir_all(out_dir);
+		std::fs::create_dir_all(out_dir.parent().unwrap()).unwrap();
+		println!("roundtripping {filename} from {input_dir}");
+		let packed = do_pack_wipf(input_dir).unwrap();
+		println!("  repacked size={}", packed.len());
+
+		let header = WIPFHeader::from_ref(&packed);
+		let entries = WIPFENTRY::from_ref_as_slice(&packed[std::mem::size_of_val(header)..], header.n_entries as usize);
+		let data_start = std::mem::size_of_val(header) + std::mem::size_of_val(entries);
+		let n_entries = header.n_entries;
+		let depth = header.depth;
+		let sum_len: usize = entries.iter().map(|e| e.length as usize).sum();
+		println!("  n_entries={n_entries} depth={depth} data_start=0x{data_start:X} total={} sum(entry.length)={sum_len} available={}", packed.len(), packed.len() - data_start);
+
+		let mut content = packed.clone();
+		do_extract_wipf(filename, out_dir, &mut content).unwrap();
+		compare_dirs(input_dir, out_dir);
+	}
 
 	#[test]
-	fn main() {
-		let input = Utf8PathBuf::from("/home/wscp/RustroverProjects/cc-fkb-tools-rs/extracted_arcs_old/Chip.arc/BGM_P1G.WIP");
-		std::fs::write("/home/wscp/RustroverProjects/cc-fkb-tools-rs/extracted_arcs/Chip.arc/BGM_P1G.WIP.new", do_pack_wipf(&input).unwrap()).unwrap();
+	fn lz77_pair_roundtrip() {
+		let data: Vec<u8> = (0..=255u8).collect();
+		let comp = crate::util::lz77_compress(&data);
+		let dec = crate::util::lz77_decompress(&comp, data.len());
+		println!("lz77: input={} compressed={} decompressed={} identical={}", data.len(), comp.len(), dec.len(), dec == data);
+		println!("  comp head: {:02X?}", &comp[..comp.len().min(16)]);
+		println!("  dec  head: {:02X?}", &dec[..dec.len().min(16)]);
+		println!("  in   head: {:02X?}", &data[..16]);
+	}
+
+	#[test]
+	fn wipf_roundtrip_8bit() {
+		let input = Utf8PathBuf::from("/home/wscp/RustroverProjects/cc-fkb-tools-rs/extracted_arcs/Chip.arc/EVCC0020A.MOS");
+		roundtrip_dir(&input, "EVCC0020A.MOS", &Utf8PathBuf::from("/tmp/wipf_rt_8"));
+	}
+
+	#[test]
+	fn wipf_roundtrip_24bit() {
+		let root = "/home/wscp/RustroverProjects/cc-fkb-tools-rs";
+		let orig = std::fs::read(format!("{root}/BGM_P1G.WIP")).unwrap();
+		let extract_dir = Utf8PathBuf::from("/tmp/wipf_rt_24/BGM_P1G.WIP");
+		let _ = std::fs::remove_dir_all(&extract_dir);
+		std::fs::create_dir_all(extract_dir.parent().unwrap()).unwrap();
+		let mut content = orig.clone();
+		do_extract_wipf("BGM_P1G.WIP", &extract_dir, &mut content).unwrap();
+		roundtrip_dir(&extract_dir, "BGM_P1G.WIP", &Utf8PathBuf::from("/tmp/wipf_rt_24_out/BGM_P1G.WIP"));
 	}
 }
 
@@ -639,7 +708,7 @@ fn write_wip_entry(
 		out_buf
 	};
 
-	let row_size = entry.width as usize * out_depth as usize;
+	let row_size = (entry.width as usize * out_depth as usize).next_multiple_of(4);
 	let out_buf_iterator = out_buf.rchunks_exact(row_size);
 
 	let (file_size, bmp_offset, imgdata_size) = if header.depth == 8 {
