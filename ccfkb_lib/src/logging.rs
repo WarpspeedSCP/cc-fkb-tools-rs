@@ -126,8 +126,6 @@ impl SimpleLogger {
 	}
 }
 
-use log::LevelFilter;
-
 pub fn init() -> Result<(), &'static str> {
 	let logger = SimpleLogger::from_env();
 	let level_filter = logger.level.to_level_filter();

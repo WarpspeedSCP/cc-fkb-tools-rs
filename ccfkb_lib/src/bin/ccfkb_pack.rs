@@ -1,6 +1,6 @@
-use camino::{Utf8Path, Utf8PathBuf};
-use ccfkb_lib::data::{arc_dirs, descriptor_paths, pack_arc, ExtensionDescriptor, FileDescriptor};
-use ccfkb_lib::{log, logging};
+use camino::Utf8Path;
+use ccfkb_lib::data::{descriptor_paths, pack_arc, ExtensionDescriptor, FileDescriptor};
+use ccfkb_lib::{log, main_preamble};
 
 use ccfkb_lib::data::text_script::{parse_doclines, tl_reverse_transform_script};
 use ccfkb_lib::opcodes::Script;
@@ -51,22 +51,16 @@ fn reencode_scripts(arc_dir: &Utf8Path) {
 }
 
 fn main() {
-	logging::init().unwrap();
+	for arc_dir in main_preamble!(file ".arc") {
+		reencode_scripts(&arc_dir);
 
-	for arg in std::env::args().skip(1) {
-		let parent = Utf8PathBuf::from(arg);
+		let ext_desc_yaml = arc_dir.join("extensions.yaml");
+		let file_desc_yaml = arc_dir.join("files.yaml");
+		let ext_descriptors: Vec<ExtensionDescriptor> = serde_yml::from_reader(std::fs::File::open(&ext_desc_yaml).unwrap()).unwrap();
+		let file_descriptors: Vec<FileDescriptor> = serde_yml::from_reader(std::fs::File::open(&file_desc_yaml).unwrap()).unwrap();
 
-		for arc_dir in arc_dirs(&parent).unwrap() {
-			reencode_scripts(&arc_dir);
-
-			let ext_desc_yaml = arc_dir.join("extensions.yaml");
-			let file_desc_yaml = arc_dir.join("files.yaml");
-			let ext_descriptors: Vec<ExtensionDescriptor> = serde_yml::from_reader(std::fs::File::open(&ext_desc_yaml).unwrap()).unwrap();
-			let file_descriptors: Vec<FileDescriptor> = serde_yml::from_reader(std::fs::File::open(&file_desc_yaml).unwrap()).unwrap();
-
-			let out_files = descriptor_paths(&arc_dir, &ext_descriptors, &file_descriptors);
-			let out_path = arc_dir.with_extension("arc.out");
-			pack_arc(&out_path, &out_files, ext_descriptors, file_descriptors).unwrap();
-		}
+		let out_files = descriptor_paths(&arc_dir, &ext_descriptors, &file_descriptors);
+		let out_path = arc_dir.with_extension("arc.out");
+		pack_arc(&out_path, &out_files, ext_descriptors, file_descriptors).unwrap();
 	}
 }

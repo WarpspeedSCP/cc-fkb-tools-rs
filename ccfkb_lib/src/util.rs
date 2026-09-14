@@ -14,6 +14,27 @@ pub fn current_dir() -> camino::Utf8PathBuf {
 	camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap()
 }
 
+/// Which kind of filesystem entry a [`crate::main_preamble!`] search accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dirness {
+	/// Any file or directory.
+	Any,
+	/// Regular files only.
+	File,
+	/// Directories only.
+	Dir,
+}
+
+impl Dirness {
+	pub fn matches(self, file_type: std::fs::FileType) -> bool {
+		match self {
+			Dirness::Any => true,
+			Dirness::File => file_type.is_file(),
+			Dirness::Dir => file_type.is_dir(),
+		}
+	}
+}
+
 pub fn safe_create_dir(dir: &camino::Utf8Path) -> std::io::Result<()> {
 	std::fs::create_dir(dir).or_else(|it| {
 		if it.kind() == std::io::ErrorKind::AlreadyExists {

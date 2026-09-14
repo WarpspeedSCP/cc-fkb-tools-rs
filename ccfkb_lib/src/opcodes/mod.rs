@@ -364,7 +364,7 @@ fn make_choice(input: &[u8]) -> Choice {
 pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 	let mut ptr = 1usize;
 	let mut fields = vec![];
-	let mut name: &'static str;
+	let name: &'static str;
 
 	macro_rules! expand_opcode_component {
         (c) => {

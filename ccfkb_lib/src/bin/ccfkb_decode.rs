@@ -4,7 +4,7 @@ use ccfkb_lib::util::current_dir;
 
 
 fn main() {
-	let files = main_preamble!(&"WSC");
+	let files = main_preamble!(file "WSC");
 
 	let target_dir = current_dir().join("wsc_files");
 	std::fs::create_dir_all(&target_dir).unwrap();

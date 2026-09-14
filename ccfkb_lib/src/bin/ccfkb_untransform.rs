@@ -3,7 +3,7 @@ use ccfkb_lib::util::current_dir;
 use ccfkb_lib::{log, main_preamble};
 
 fn main() {
-	let files: Vec<_> = main_preamble!(&"WSC.txt").collect();
+	let files: Vec<_> = main_preamble!(file "WSC.txt").collect();
 	let out_parent_path = files.first().unwrap().parent().unwrap().file_name().unwrap();
 	let out_path = current_dir().join(out_parent_path).with_extension("yaml");
 

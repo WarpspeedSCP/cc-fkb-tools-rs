@@ -11,17 +11,18 @@ pub use rayon;
 pub use walkdir;
 
 #[macro_export]
-macro_rules! main_preamble {
-     ($type: expr) => {
+macro_rules! main_preamble_inner {
+     ($type: expr, $dirness: expr) => {
           {
             use camino::Utf8PathBuf as PathBuf;
             use ccfkb_lib::walkdir;
             use ccfkb_lib::logging;
+            use ccfkb_lib::util::Dirness;
 
             logging::init().unwrap();
 
             let args = std::env::args().skip(1).collect::<Vec<_>>();
-            
+
             let files = args.into_iter().flat_map(|it| {
                 walkdir::WalkDir::new(it)
                     .max_depth(2)
@@ -31,15 +32,27 @@ macro_rules! main_preamble {
                     .filter_map(|it| it.ok())
                     .filter(|it| {
                       ccfkb_lib::log::info!("{}", it.path().display());
-                      (it.file_type().is_file() || it.file_type().is_dir())
-                        && (str::is_empty($type) || ccfkb_lib::util::ends_with_ignore_case(&it.file_name().to_string_lossy(), $type))
+                      let dirness_ok = $dirness.matches(it.file_type());
+                      dirness_ok
+                        && (str::is_empty($type) || ccfkb_lib::util::ends_with_ignore_case(&it.file_name().to_string_lossy(), &$type))
                     })
                     .map(|it| PathBuf::from_path_buf(it.into_path()).unwrap())
             });
-            
+
             files
          }
      };
  }
 
-
+#[macro_export]
+macro_rules! main_preamble {
+    (dir $type: expr) => {
+        $crate::main_preamble_inner!($type, Dirness::Dir)
+    };
+    (file $type: expr) => {
+        $crate::main_preamble_inner!($type, Dirness::File)
+    };
+    ($type: expr) => {
+        $crate::main_preamble_inner!($type, Dirness::Any)
+    };
+}

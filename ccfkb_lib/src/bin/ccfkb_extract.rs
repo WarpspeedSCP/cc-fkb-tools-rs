@@ -3,7 +3,7 @@ use ccfkb_lib::data::{read_arc, ArcContents};
 use ccfkb_lib::main_preamble;
 
 fn main() {
-	let files = main_preamble!(&"ARC");
+	let files = main_preamble!(dir "ARC");
 
 	std::fs::create_dir_all("extracted_arcs").unwrap();
 

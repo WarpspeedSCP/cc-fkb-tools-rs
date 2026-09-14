@@ -3,7 +3,7 @@ use ccfkb_lib::main_preamble;
 use ccfkb_lib::util::current_dir;
 
 fn main() {
-	let files: Vec<_> = main_preamble!(&"WSC.yaml").collect();
+	let files: Vec<_> = main_preamble!(file "WSC.yaml").collect();
 	let current_dir = current_dir();
 	if files.len() == 1 {
 		let in_file = files.first().unwrap();

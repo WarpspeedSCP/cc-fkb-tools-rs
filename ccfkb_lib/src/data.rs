@@ -1,13 +1,8 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::ops::Deref;
-use std::path::PathBuf;
 use crate::opcodes::{make_opcode, Script};
 use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress, lz77_compress};
 use camino::{Utf8Path as Utf8Path, Utf8PathBuf};
-use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
-use regex::Regex;
 use crate::data::text_script::hex_int;
 
 pub mod text_script;
@@ -109,7 +104,6 @@ impl From<&[u8]> for BMPDibV3Header {
 		unsafe {
 			let data = slice[..40].as_ptr();
 			let out: &BMPDibV3Header = &*(std::mem::transmute::<_, *const BMPDibV3Header>(data as *const BMPDibV3Header));
-			let val = &*out;
 			BMPDibV3Header {
 				header_sz: size_of::<BMPDibV3Header>() as u32,
 				width: out.width,
@@ -421,23 +415,6 @@ pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> (Vec<ExtensionDescri
 	(extension_descriptors, file_descriptors, pack_files, file_data_start, data_offset)
 }
 
-/// Immediate subdirectories of `parent` whose file name ends in `.arc`, sorted.
-///
-/// Shared arc discovery for the packing tools: with the documented input model the
-/// supplied path is the parent directory that contains the extracted arc dirs.
-pub fn arc_dirs(parent: &Utf8Path) -> std::io::Result<Vec<Utf8PathBuf>> {
-	let mut dirs = vec![];
-	for entry in parent.read_dir_utf8()? {
-		let entry = entry?;
-		let path = entry.path();
-		if entry.file_name().to_ascii_lowercase().ends_with(".arc") && path.is_dir() {
-			dirs.push(path.to_owned());
-		}
-	}
-	dirs.sort();
-	Ok(dirs)
-}
-
 /// Direct content entries of an extracted arc directory, sorted.
 ///
 /// The YAML sidecars (`files.yaml`, `extensions.yaml`) are metadata rather than arc
@@ -494,13 +471,10 @@ fn rotate_wsc_for_pack(input: &mut [u8]) {
 }
 
 fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
-	use nom::branch::alt;
-	use nom::bytes::complete::{tag, take_until, take_while};
-	use nom::combinator::{map_res, value};
-	use nom::multi::{many0, separated_list0};
-	use nom::sequence::{preceded, terminated};
+	use nom::bytes::complete::tag;
+	use nom::sequence::terminated;
 	use nom::IResult;
-	use nom::{AsChar, Parser};
+	use nom::Parser;
 
 	let mut files_to_pack = walkdir::WalkDir::new(input_dir).contents_first(false).into_iter().skip(1).map(|entry| entry.unwrap().into_path()).collect::<Vec<_>>();
 	files_to_pack.sort();
@@ -523,7 +497,7 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 
 	for file in files_to_pack {
 		let path = Utf8Path::from_path(&file).unwrap();
-		let (_, (_, index, x, y)) = parse_file_name(file_name, path.file_name().unwrap()).unwrap();
+		let (_, (_, _, x, y)) = parse_file_name(file_name, path.file_name().unwrap()).unwrap();
 
 		let bmp = std::fs::read(file)?;
 
@@ -818,7 +792,7 @@ fn write_wip_entry(
 pub fn decode_wsc(input: &[u8]) -> Script {
 	let mut ptr = 0;
 	let mut opcodes = vec![];
-	let mut at_end = false;
+	let mut at_end;
 
 	while ptr < input.len() {
 		let op = make_opcode(&input[ptr..], ptr);

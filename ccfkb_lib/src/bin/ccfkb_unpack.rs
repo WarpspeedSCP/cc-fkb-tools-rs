@@ -9,7 +9,7 @@ use ccfkb_lib::{log, main_preamble};
 fn main() {
 	let top_out_path = current_dir().join("extracted_arcs");
 	safe_create_dir(&top_out_path).unwrap();
-	let files: Vec<_> = main_preamble!(&"arc").collect();
+	let files: Vec<_> = main_preamble!(file "arc").collect();
 
 	for i in files {
 		let dirent = i;

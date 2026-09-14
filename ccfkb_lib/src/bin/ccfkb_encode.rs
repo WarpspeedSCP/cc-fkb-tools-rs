@@ -4,7 +4,7 @@ use ccfkb_lib::util::current_dir;
 use std::fs::create_dir_all;
 
 fn main() {
-	let files = main_preamble!(&"WSC.yaml").collect::<Vec<_>>();
+	let files = main_preamble!(file "WSC.yaml").collect::<Vec<_>>();
 
 	let output_folder = files.first().unwrap().parent().unwrap().file_name().unwrap();
 
