@@ -421,6 +421,66 @@ pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> (Vec<ExtensionDescri
 	(extension_descriptors, file_descriptors, pack_files, file_data_start, data_offset)
 }
 
+/// Immediate subdirectories of `parent` whose file name ends in `.arc`, sorted.
+///
+/// Shared arc discovery for the packing tools: with the documented input model the
+/// supplied path is the parent directory that contains the extracted arc dirs.
+pub fn arc_dirs(parent: &Utf8Path) -> std::io::Result<Vec<Utf8PathBuf>> {
+	let mut dirs = vec![];
+	for entry in parent.read_dir_utf8()? {
+		let entry = entry?;
+		let path = entry.path();
+		if entry.file_name().to_ascii_lowercase().ends_with(".arc") && path.is_dir() {
+			dirs.push(path.to_owned());
+		}
+	}
+	dirs.sort();
+	Ok(dirs)
+}
+
+/// Direct content entries of an extracted arc directory, sorted.
+///
+/// The YAML sidecars (`files.yaml`, `extensions.yaml`) are metadata rather than arc
+/// content, so they are excluded.
+pub fn arc_entries(arc_dir: &Utf8Path) -> std::io::Result<Vec<Utf8PathBuf>> {
+	let mut entries = vec![];
+	for entry in arc_dir.read_dir_utf8()? {
+		let entry = entry?;
+		let path = entry.path();
+		let is_yaml = path
+			.extension()
+			.map(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+			.unwrap_or(false);
+		if !is_yaml {
+			entries.push(path.to_owned());
+		}
+	}
+	entries.sort();
+	Ok(entries)
+}
+
+/// Resolves the descriptor-ordered on-disk paths inside `arc_dir` (e.g. `Chip.arc/BGM_P1G.WIP`),
+/// following the extension/file descriptor order recorded at unpack time.
+pub fn descriptor_paths(arc_dir: &Utf8Path, extensions: &[ExtensionDescriptor], files: &[FileDescriptor]) -> Vec<Utf8PathBuf> {
+	let mut paths = vec![];
+	let mut file_iter = files.iter();
+	for ExtensionDescriptor { name: ext, number, .. } in extensions {
+		for _ in 0..*number {
+			match file_iter.next() {
+				Some(file_desc) => paths.push(arc_dir.join(format!("{}.{}", file_desc.name, ext))),
+				None => log::warn!("No more file descriptors left for extension {ext}!"),
+			}
+		}
+	}
+	paths
+}
+
+/// Serializes an arc from `input_files` + descriptors and writes it to `output_path`.
+pub fn pack_arc(output_path: &Utf8Path, input_files: &[Utf8PathBuf], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> std::io::Result<()> {
+	let output = write_arc(input_files, extensions, files);
+	std::fs::write(output_path, output)
+}
+
 fn rotate_wsc_for_unpack(input: &mut [u8]) {
 	for i in input.iter_mut() {
 		*i = i.rotate_right(2);
@@ -501,7 +561,9 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 		entry.length = entry_out_buffer.len() as u32;
 
 		let entry_final_data = if depth_is_8 {
-			(0..=0xFF).flat_map(|it| [it, it, it, 0]).chain(entry_out_buffer).collect()
+			// copy palette over from the bitmap.
+			let palette = &entry_data[..0x400];
+			palette.iter().copied().chain(entry_out_buffer).collect()
 		} else {
 			entry_out_buffer
 		};
