@@ -1,81 +1,72 @@
-use camino::{Utf8Path as Utf8Path, Utf8PathBuf as PathBuf};
-use ccfkb_lib::data::{write_arc, ExtensionDescriptor, FileDescriptor};
-use ccfkb_lib::{log, main_preamble};
+use camino::{Utf8Path, Utf8PathBuf};
+use ccfkb_lib::data::{arc_dirs, descriptor_paths, pack_arc, ExtensionDescriptor, FileDescriptor};
+use ccfkb_lib::{log, logging};
 
 use ccfkb_lib::data::text_script::{parse_doclines, tl_reverse_transform_script};
 use ccfkb_lib::opcodes::Script;
 
 fn encode_wsc_file_command(yaml_name_path: &Utf8Path, script: Script) -> Vec<u8> {
 	log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default());
-	let out = script.binary_serialise();
-	out
+	script.binary_serialise()
 }
 
 fn untransform_wsc_file_command(yaml_file: &Utf8Path, yaml_text: &str, text: &str) -> Script {
 	log::info!("Untransforming file {}", &yaml_file.file_name().unwrap_or_default());
-	let mut script: Script = serde_yml::from_str(&yaml_text).unwrap();
-	let (_, doclines) = parse_doclines(&text).unwrap();
+	let mut script: Script = serde_yml::from_str(yaml_text).unwrap();
+	let (_, doclines) = parse_doclines(text).unwrap();
 
 	tl_reverse_transform_script(&mut script, doclines);
 
 	script
 }
 
-fn main() {
-	let files: Vec<_> = main_preamble!(&"WSC.txt").collect();
-	let files = if files.is_empty() {
-		let args = std::env::args().collect::<Vec<_>>();
-		args.iter().skip(1).map(|it| PathBuf::from(it).join("nonexistant")).collect::<Vec<_>>()
-	} else {
-		files
-	};
-	let yaml_folder = files
-		.first()
-		.expect("Expected the folder to contain files!")
-		.parent()
-		.expect("Expected files.yaml and extensions.yaml to exist within the parent directory!")
-		.with_extension("yaml");
+/// Re-encodes every edited `*.WSC.txt` back into its arc directory.
+///
+/// The translation lives in `<arc>.script/` and the structure it is applied to lives in
+/// `<arc>.yaml/`, so the encoded `*.WSC` overwrites the unpacked copy inside `<arc>/`.
+fn reencode_scripts(arc_dir: &Utf8Path) {
+	let script_folder = arc_dir.with_extension("arc.script");
+	let yaml_folder = arc_dir.with_extension("arc.yaml");
 
-	let output_folder = yaml_folder.with_extension("");
-	let file_desc_yaml = output_folder.join("files.yaml");
-	let ext_desc_yaml = output_folder.join("extensions.yaml");
+	if !script_folder.is_dir() {
+		return;
+	}
 
-	for script_file in files {
-		// SAFETY: These files are expected to exist with valid utf8 names, nothing should be accessing them concurrently.
-		let file_name = script_file.file_name().unwrap();
-		if file_name == "nonexistant" {
-			break;
+	for entry in script_folder.read_dir_utf8().unwrap() {
+		let script_file = entry.unwrap().path().to_owned();
+		if !script_file.file_name().map(|it| it.to_ascii_uppercase().ends_with(".WSC.TXT")).unwrap_or(false) {
+			continue;
 		}
 
 		let text = std::fs::read_to_string(&script_file).unwrap();
-		let yaml_file = yaml_folder.join(file_name).with_extension("yaml");
+		let yaml_file = yaml_folder.join(script_file.file_name().unwrap()).with_extension("yaml");
 		let yaml_text = std::fs::read_to_string(&yaml_file).unwrap();
 
 		let yaml_script = untransform_wsc_file_command(&yaml_file, &yaml_text, &text);
-
 		let encoded_script = encode_wsc_file_command(&yaml_file, yaml_script);
-		std::fs::write(output_folder.join(yaml_file.with_extension("").file_name().unwrap()), encoded_script).unwrap();
+
+		let out_name = script_file.file_stem().expect("expected a script file name");
+		std::fs::write(arc_dir.join(out_name), encoded_script).unwrap();
 	}
+}
 
-	{
-		let ext_descriptors: Vec<ExtensionDescriptor> = serde_yml::from_reader(std::fs::File::open(&ext_desc_yaml).unwrap()).unwrap();
-		let file_descriptors: Vec<FileDescriptor> = serde_yml::from_reader(std::fs::File::open(&file_desc_yaml).unwrap()).unwrap();
+fn main() {
+	logging::init().unwrap();
 
-		let mut file_desc_iter = file_descriptors.iter().peekable();
+	for arg in std::env::args().skip(1) {
+		let parent = Utf8PathBuf::from(arg);
 
-		let mut out_files = vec![];
-		for ExtensionDescriptor { name: ext, number, .. } in ext_descriptors.iter() {
-			for _ in 0..*number {
-				if let Some(file_desc) = file_desc_iter.next() {
-					let name = format!("{}.{}", file_desc.name, ext);
-					out_files.push(output_folder.join(name));
-				} else {
-					log::warn!("No more files left!");
-				}
-			}
+		for arc_dir in arc_dirs(&parent).unwrap() {
+			reencode_scripts(&arc_dir);
+
+			let ext_desc_yaml = arc_dir.join("extensions.yaml");
+			let file_desc_yaml = arc_dir.join("files.yaml");
+			let ext_descriptors: Vec<ExtensionDescriptor> = serde_yml::from_reader(std::fs::File::open(&ext_desc_yaml).unwrap()).unwrap();
+			let file_descriptors: Vec<FileDescriptor> = serde_yml::from_reader(std::fs::File::open(&file_desc_yaml).unwrap()).unwrap();
+
+			let out_files = descriptor_paths(&arc_dir, &ext_descriptors, &file_descriptors);
+			let out_path = arc_dir.with_extension("arc.out");
+			pack_arc(&out_path, &out_files, ext_descriptors, file_descriptors).unwrap();
 		}
-
-		let output = write_arc(&out_files, ext_descriptors, file_descriptors);
-		std::fs::write(output_folder.with_extension("arc.out"), output).unwrap();
 	}
 }
