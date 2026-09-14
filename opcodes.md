@@ -1,5 +1,13 @@
 opcodes
 
+> **LEGACY — superseded (marked 2026-XX).** Layouts here are the original hand transcription; use
+> [`validation/binary_layout.md`](validation/binary_layout.md) (authoritative layouts),
+> [`validation/opcode_reference.md`](validation/opcode_reference.md) (behaviour + known bugs) and
+> [`validation/font_work/hv_opcode_access_map.md`](validation/font_work/hv_opcode_access_map.md)
+> (verified heap/script-variable operands). Known-wrong here: 0x0D's "4-byte arg3", 0x24's
+> "sleep timers", 0x00 as "heap/mode reset" (= 0x03 type 0), 0x59's trailing dword, and the
+> 0x25 field widths.
+
 0x01: 1 
      + 1 byte branch_type
      + 2 byte arg1

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -10,6 +11,9 @@ use regex::Regex;
 use crate::data::text_script::hex_int;
 
 pub mod text_script;
+
+/// On-disk size of a file descriptor: 13-byte null-padded SJIS name + u32 size + u32 offset.
+const FILE_DESCRIPTOR_SIZE: usize = 13 + 4 + 4;
 
 #[repr(C, packed)]
 pub struct WIPFHeader {
@@ -337,16 +341,20 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 
 		output.extend(sjis_name);
 		let mut contents = std::fs::read(&curr_path).unwrap();
-
+		let actual_content_len = contents.len();
+		let extra_len = actual_content_len.next_multiple_of(4) - actual_content_len;
 		if curr_path.file_name().map(|it| it.to_ascii_uppercase().ends_with("WSC")).unwrap_or_default() {
 			rotate_wsc_for_pack(&mut contents)
 		}
 
-		output.extend(&(contents.len() as u32).to_le_bytes());
+		output.extend((actual_content_len as u32).to_le_bytes());
 		output.extend(&(curr_offset as u32).to_le_bytes());
-		curr_offset += contents.len();
+		curr_offset += actual_content_len + extra_len;
 
 		things_to_append.push(contents);
+		if extra_len > 0 {
+			things_to_append.push(vec![0u8; extra_len]);
+		}
 	}
 
 	things_to_append.iter().for_each(|it| output.extend(it));
@@ -354,6 +362,63 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 	output
 }
 
+pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> (Vec<ExtensionDescriptor>, Vec<FileDescriptor>, Vec<Utf8PathBuf>, usize, u32) {
+	let mut grouped: BTreeMap<String, Vec<camino::Utf8PathBuf>> = BTreeMap::new();
+
+	for file in files {
+		let ext = file.extension().map(|it| it.to_uppercase()).unwrap_or_default();
+		grouped.entry(ext).or_default().push(file.clone());
+	}
+
+	for group in grouped.values_mut() {
+		group.sort();
+	}
+
+	let mut extension_descriptors: Vec<ExtensionDescriptor> = grouped
+		.iter()
+		.map(|(name, group)| ExtensionDescriptor {
+			name: name.clone(),
+			number: group.len() as u32,
+			offset: 0,
+		})
+		.collect();
+
+	let extension_list_size: usize = extension_descriptors.iter().map(ExtensionDescriptor::size).sum();
+
+	let mut file_descriptors: Vec<FileDescriptor> = vec![];
+	let mut pack_files: Vec<Utf8PathBuf> = vec![];
+	for (_, group) in grouped.into_iter() {
+		for file in group.into_iter() {
+			file_descriptors.push(FileDescriptor {
+				name: file.file_stem().unwrap().to_uppercase(),
+				size: std::fs::metadata(&file).unwrap().len().next_multiple_of(4) as u32,
+				offset: 0,
+			});
+			pack_files.push(file);
+		}
+	}
+
+	let file_list_size = FILE_DESCRIPTOR_SIZE * file_descriptors.len();
+
+	// Start offset of files = 4 (n_extensions header) + extension descriptor list + file descriptor list.
+	let file_data_start = 4 + extension_list_size + file_list_size;
+
+	// Iterate over the descriptors and fill in the calculated offsets:
+	//    - each extension descriptor's offset points at the start of its file descriptor block;
+	//    - each file descriptor's offset points at its data (write_arc recomputes the same values).
+	let mut descriptor_block_offset = 4 + extension_list_size;
+	for descriptor in &mut extension_descriptors {
+		descriptor.offset = descriptor_block_offset as u32;
+		descriptor_block_offset += FILE_DESCRIPTOR_SIZE * descriptor.number as usize;
+	}
+
+	let mut data_offset = file_data_start as u32;
+	for descriptor in &mut file_descriptors {
+		descriptor.offset = data_offset;
+		data_offset += descriptor.size;
+	}
+	(extension_descriptors, file_descriptors, pack_files, file_data_start, data_offset)
+}
 
 fn rotate_wsc_for_unpack(input: &mut [u8]) {
 	for i in input.iter_mut() {

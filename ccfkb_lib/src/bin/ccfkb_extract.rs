@@ -19,7 +19,7 @@ fn main() {
 			files,
 			filenames,
 			data
-		} = read_arc(&mut file_contents[..], &path, false);
+		} = read_arc(&mut file_contents[..], &path, true);
 
 		let exts_yml_path = path.join("extensions.yml");
 		let exts_yml = serde_yml::to_string(&exts).unwrap();
