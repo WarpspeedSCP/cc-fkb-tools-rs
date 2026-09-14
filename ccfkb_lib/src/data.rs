@@ -603,6 +603,38 @@ mod test {
 	}
 
 	#[test]
+	fn lz77_matches_original_entries() {
+		let root = "/home/wscp/RustroverProjects/cc-fkb-tools-rs";
+		let file = "BGM_P1G.WIP";
+		let content = std::fs::read(format!("{root}/{file}")).unwrap();
+		let header = WIPFHeader::from_ref(&content);
+		let entries = WIPFENTRY::from_ref_as_slice(&content[std::mem::size_of_val(header)..], header.n_entries as usize);
+		let data_start = std::mem::size_of_val(header) + std::mem::size_of_val(entries);
+		let data = &content[data_start..];
+		let mut data_ptr = 0usize;
+		let mut mismatches = 0usize;
+		for (i, entry) in entries.iter().enumerate() {
+			let out_depth = 3usize;
+			let out_stride = (entry.width as usize * out_depth + 3) & !3;
+			let out_len = entry.height as usize * out_stride;
+			let original = &data[data_ptr..data_ptr + entry.length as usize];
+			let decompressed = crate::util::lz77_decompress(original, out_len);
+			let recompressed = crate::util::lz77_compress(&decompressed);
+			if recompressed != original {
+				mismatches += 1;
+				println!("  entry {i}: original_len={} recompressed_len={}", original.len(), recompressed.len());
+				if mismatches <= 3 {
+					let first_diff = original.iter().zip(recompressed.iter()).position(|(a, b)| a != b);
+					println!("    first_diff={:?}", first_diff);
+				}
+			}
+			data_ptr += entry.length as usize;
+		}
+		println!("{file}: {} entries, {} mismatches", entries.len(), mismatches);
+		assert_eq!(mismatches, 0);
+	}
+
+	#[test]
 	fn wipf_roundtrip_8bit() {
 		let input = Utf8PathBuf::from("/home/wscp/RustroverProjects/cc-fkb-tools-rs/extracted_arcs/Chip.arc/EVCC0020A.MOS");
 		roundtrip_dir(&input, "EVCC0020A.MOS", &Utf8PathBuf::from("/tmp/wipf_rt_8"));

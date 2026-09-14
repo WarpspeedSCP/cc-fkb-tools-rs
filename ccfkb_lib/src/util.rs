@@ -256,13 +256,234 @@ pub fn to_bytes<T: Sized>(value: &T) -> &[u8] {
 	}
 }
 
-// A very dumb compression implementation fo LZ77 that will actually *increase* file size, not decrease it.
-pub(crate) fn lz77_compress(input: &[u8]) -> Vec<u8> {
+/// LZSS constants matching CrossChannelCrack's `unwipf` / the game's own
+/// save-file compressor (`sub_4595A0` in CROSSCHANNEL.exe).
+const LZSS_N: usize = 4096; // window / ring size
+const LZSS_F: usize = 17; // max match length (encoded as 4-bit length + 2)
+const LZSS_NIL: usize = 4096; // sentinel used as the parent of the tree root
 
-			input
-				.chunks(8)
-				.flat_map(|chunk| [0xFF].iter().chain(chunk))
-				.map(|byte| *byte).collect()
+/// Binary-search-tree state for the original LZSS match finder.
+struct LzssState {
+	text_buf: Vec<u8>,
+	dad: Vec<usize>,
+	lson: Vec<usize>,
+	rson: Vec<usize>,
+}
+
+impl LzssState {
+	fn new() -> Self {
+		Self {
+			text_buf: vec![0u8; LZSS_N],
+			dad: vec![0usize; LZSS_NIL + 1],
+			lson: vec![0usize; LZSS_NIL + 1],
+			rson: vec![0usize; LZSS_NIL + 1],
+		}
+	}
+
+	// Okumura LZSS `InsertNode`. Finds the longest match for the string at `r`
+	// and inserts position `r` into the tree. `match_pos` receives the best
+	// matching position. Returns the match length (0..=17).
+	fn insert_node(&mut self, r: usize, match_pos: &mut usize) -> i32 {
+		if r == 0 {
+			return 0;
+		}
+
+		let mut p = self.rson[LZSS_NIL];
+		let mut best = 0usize;
+		let mut diff: i32 = 0;
+
+		loop {
+			let mut i = 0usize;
+			let mut key_idx = r;
+
+			loop {
+				diff = self.text_buf[key_idx & 0xFFF] as i32 - self.text_buf[(p + i) & 0xFFF] as i32;
+				if diff != 0 {
+					break;
+				}
+				i += 1;
+				key_idx += 1;
+				if i >= LZSS_F {
+					break;
+				}
+			}
+
+			// The original uses `>=` here, so on a tie the later node visited
+			// during the tree walk wins. This matters for byte-identical output.
+			if i >= best {
+				best = i;
+				*match_pos = p;
+				if i >= LZSS_F {
+					self.contract_node(p, r);
+					return i as i32;
+				}
+			}
+
+			let child = if diff < 0 { self.lson[p] } else { self.rson[p] };
+			if child == 0 {
+				break;
+			}
+			p = child;
+		}
+
+		if diff < 0 {
+			self.lson[p] = r;
+		} else {
+			self.rson[p] = r;
+		}
+		self.dad[r] = p;
+		self.lson[r] = 0;
+		self.rson[r] = 0;
+		best as i32
+	}
+
+	fn delete_node(&mut self, p: usize) {
+		if self.dad[p] == 0 {
+			return;
+		}
+
+		if self.rson[p] == 0 {
+			let q = self.lson[p];
+			self.replace_node(q, p);
+		} else if self.lson[p] == 0 {
+			let q = self.rson[p];
+			self.replace_node(q, p);
+		} else {
+			let q = self.next_node(p);
+			self.delete_node(q);
+			self.contract_node(p, q);
+		}
+	}
+
+	// Replaces node `p` with node `q` and unlinks `p`.
+	fn replace_node(&mut self, q: usize, p: usize) {
+		let d = self.dad[p];
+		self.dad[q] = d;
+		if self.rson[d] == p {
+			self.rson[d] = q;
+		} else {
+			self.lson[d] = q;
+		}
+		self.dad[p] = 0;
+	}
+
+	// Replaces node `p` with node `q`, moving `p`'s children over to `q`.
+	fn contract_node(&mut self, p: usize, q: usize) {
+		let d = self.dad[p];
+		if self.lson[d] == p {
+			self.lson[d] = q;
+		} else {
+			self.rson[d] = q;
+		}
+
+		self.dad[q] = d;
+		self.lson[q] = self.lson[p];
+		self.rson[q] = self.rson[p];
+
+		let lq = self.lson[q];
+		self.dad[lq] = q;
+		let rq = self.rson[q];
+		self.dad[rq] = q;
+
+		self.dad[p] = 0;
+	}
+
+	// Rightmost node in `p`'s left subtree.
+	fn next_node(&self, p: usize) -> usize {
+		let mut q = self.lson[p];
+		while self.rson[q] != 0 {
+			q = self.rson[q];
+		}
+		q
+	}
+}
+
+/// Port of CrossChannelCrack's LZSS compressor (`sub_4595A0` in
+/// CROSSCHANNEL.exe). Produces a stream compatible with [`lz77_decompress`].
+pub(crate) fn lz77_compress(input: &[u8]) -> Vec<u8> {
+	let mut state = LzssState::new();
+	let mut out = Vec::new();
+
+	let mut code_buf = [0u8; 17];
+	let mut code_ptr = 0usize;
+	let mut mask: u8 = 1;
+
+	let in_len = input.len();
+	let mut input_pos = 0usize;
+	let mut r = 1usize;
+
+	// Prime the ring buffer with up to LZSS_F bytes.
+	let mut len = 0usize;
+	while len < LZSS_F && input_pos < in_len {
+		state.text_buf[1 + len] = input[input_pos];
+		len += 1;
+		input_pos += 1;
+	}
+
+	// Initialise the tree with the single root node at position 1.
+	state.rson[LZSS_NIL] = 1;
+	state.dad[1] = LZSS_NIL;
+	state.rson[1] = 0;
+	state.lson[1] = 0;
+
+	let mut match_pos = 0usize;
+	let mut match_len = 0usize;
+
+	while len != 0 {
+		if match_len > len {
+			match_len = len;
+		}
+
+		let consume_count;
+		if match_len <= 1 {
+			// Literal: flag bit set, one data byte.
+			code_buf[0] |= mask;
+			code_buf[1 + code_ptr] = state.text_buf[r];
+			consume_count = 1;
+			code_ptr += 1;
+		} else {
+			// Match: flag bit clear, 12-bit position + 4-bit length-2.
+			let value = ((match_len - 2) | (match_pos << 4)) & 0xFFFF;
+			code_buf[1 + code_ptr] = (value >> 8) as u8;
+			code_buf[2 + code_ptr] = value as u8;
+			consume_count = match_len;
+			code_ptr += 2;
+		}
+
+		mask = mask.wrapping_shl(1);
+		if mask == 0 {
+			// A full group of 8 symbols; flush flags byte + data.
+			out.extend_from_slice(&code_buf[..code_ptr + 1]);
+			code_ptr = 0;
+			code_buf = [0u8; 17];
+			mask = 1;
+		}
+
+		let mut count = consume_count;
+		while count != 0 {
+			let s = (r + LZSS_F) & 0xFFF;
+			state.delete_node(s);
+
+			if input_pos >= in_len {
+				len -= 1;
+			} else {
+				state.text_buf[s] = input[input_pos];
+				input_pos += 1;
+			}
+
+			r = (r + 1) & 0xFFF;
+			if len != 0 {
+				match_len = state.insert_node(r, &mut match_pos) as usize;
+			}
+
+			count -= 1;
+		}
+	}
+
+	// Final flush: partial flags byte, partial data, and the two zero bytes
+	// that form the end-of-stream marker (a zero-position match).
+	out.extend_from_slice(&code_buf[..code_ptr + 3]);
+	out
 }
 
 // unsigned long CrossChannelCrack::unwipf( unsigned char* buff,      // 输入文件正文的array
