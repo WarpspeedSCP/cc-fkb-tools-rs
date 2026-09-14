@@ -24,11 +24,15 @@ macro_rules! main_preamble {
             
             let files = args.into_iter().flat_map(|it| {
                 walkdir::WalkDir::new(it)
+                    .max_depth(2)
+                    .contents_first(false)
                     .into_iter()
+                    .skip(1)
                     .filter_map(|it| it.ok())
                     .filter(|it| {
                       ccfkb_lib::log::info!("{}", it.path().display());
-                      it.file_type().is_file() && (str::is_empty($type) || ccfkb_lib::util::ends_with_ignore_case(&it.file_name().to_string_lossy(), $type))
+                      (it.file_type().is_file() || it.file_type().is_dir())
+                        && (str::is_empty($type) || ccfkb_lib::util::ends_with_ignore_case(&it.file_name().to_string_lossy(), $type))
                     })
                     .map(|it| PathBuf::from_path_buf(it.into_path()).unwrap())
             });

@@ -340,24 +340,22 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 		};
 
 		output.extend(sjis_name);
-		let mut contents = std::fs::read(&curr_path).unwrap();
+		let mut contents = if curr_path.is_dir() {
+			do_pack_wipf(&curr_path).unwrap_or_default()
+		} else {
+			std::fs::read(&curr_path).unwrap()
+		};
 		if curr_path.file_name().map(|it| it.to_ascii_uppercase().ends_with("WSC")).unwrap_or_default() {
 			rotate_wsc_for_pack(&mut contents)
-		} else if curr_path.is_dir() {
-			contents = do_pack_wipf(&curr_path).unwrap_or_default();
 		}
 
 		let actual_content_len = contents.len();
-		let extra_len = actual_content_len.next_multiple_of(4) - actual_content_len;
 
 		output.extend((actual_content_len as u32).to_le_bytes());
 		output.extend(&(curr_offset as u32).to_le_bytes());
-		curr_offset += actual_content_len + extra_len;
+		curr_offset += actual_content_len;
 
 		things_to_append.push(contents);
-		if extra_len > 0 {
-			things_to_append.push(vec![0u8; extra_len]);
-		}
 	}
 
 	things_to_append.iter().for_each(|it| output.extend(it));
