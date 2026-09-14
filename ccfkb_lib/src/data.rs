@@ -341,11 +341,14 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 
 		output.extend(sjis_name);
 		let mut contents = std::fs::read(&curr_path).unwrap();
-		let actual_content_len = contents.len();
-		let extra_len = actual_content_len.next_multiple_of(4) - actual_content_len;
 		if curr_path.file_name().map(|it| it.to_ascii_uppercase().ends_with("WSC")).unwrap_or_default() {
 			rotate_wsc_for_pack(&mut contents)
+		} else if curr_path.is_dir() {
+			contents = do_pack_wipf(&curr_path).unwrap_or_default();
 		}
+
+		let actual_content_len = contents.len();
+		let extra_len = actual_content_len.next_multiple_of(4) - actual_content_len;
 
 		output.extend((actual_content_len as u32).to_le_bytes());
 		output.extend(&(curr_offset as u32).to_le_bytes());
@@ -441,7 +444,8 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 	use nom::IResult;
 	use nom::{AsChar, Parser};
 
-	let files_to_pack = walkdir::WalkDir::new(input_dir).contents_first(false).into_iter().skip(1).map(|entry| entry.unwrap().into_path()).collect::<Vec<_>>();
+	let mut files_to_pack = walkdir::WalkDir::new(input_dir).contents_first(false).into_iter().skip(1).map(|entry| entry.unwrap().into_path()).collect::<Vec<_>>();
+	files_to_pack.sort();
 	let depth_is_8 = files_to_pack.get(0).map(|it| Utf8Path::from_path(&it).unwrap().file_name().unwrap().contains("d08")).unwrap_or(false);
 
 	let file_name = input_dir.file_name().unwrap();
@@ -462,8 +466,7 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 
 		let dib_header = BMPDibV3Header::from(&bmp[14..(14 + 40)]);
 
-		let entry = WIPFENTRY::new(dib_header.width, dib_header.height, x, y, dib_header.width * dib_header.height * (header.depth / 8) as u32);
-		wipf_entries.push(entry);
+		let mut entry = WIPFENTRY::new(dib_header.width, dib_header.height, x, y, dib_header.width * dib_header.height * (header.depth / 8) as u32);
 
 		let entry_data = &bmp[(14 + 40)..];
 
@@ -493,15 +496,18 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 			}
 			lz77_compress(&entry_out_buffer)
 		} else {
-			lz77_compress(compression_data)
+			lz77_compress(&entry_data_flip_iter.flatten().copied().collect::<Vec<u8>>())
 		};
 
+		entry.length = entry_out_buffer.len() as u32;
+
 		let entry_final_data = if depth_is_8 {
-			(0..0xFF).flat_map(|it| [it, it, it, 0]).chain(entry_out_buffer).collect()
+			(0..=0xFF).flat_map(|it| [it, it, it, 0]).chain(entry_out_buffer).collect()
 		} else {
 			entry_out_buffer
 		};
 
+		wipf_entries.push(entry);
 		wipf_contents.extend(entry_final_data);
 	}
 
