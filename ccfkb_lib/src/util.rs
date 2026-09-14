@@ -290,7 +290,7 @@ impl LzssState {
 
 		let mut p = self.rson[LZSS_NIL];
 		let mut best = 0usize;
-		let mut diff: i32 = 0;
+		let mut diff: i32;
 
 		loop {
 			let mut i = 0usize;

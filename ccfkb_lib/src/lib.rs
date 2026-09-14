@@ -27,18 +27,10 @@ macro_rules! main_preamble_inner {
                 // if the arg is a file, we can't skip anything.
                 // if its a dir, we probably want to skip the dir itself.
                 let path = PathBuf::from(it);
-                if path.is_file() {
-                    walkdir::WalkDir::new(path)
-                        .max_depth(2)
-                        .contents_first(false).into_iter()
-                    .collect::<Vec<_>>()
-                } else {
-                    walkdir::WalkDir::new(path)
-                        .max_depth(2)
-                        .contents_first(false)
-                        .into_iter()
-                        .skip(1).collect::<Vec<_>>()
-                }
+
+                walkdir::WalkDir::new(path)
+                .max_depth(2)
+                .contents_first(false)
                 .into_iter()
                 .filter_map(|it| it.ok())
                 .filter(|it| {
