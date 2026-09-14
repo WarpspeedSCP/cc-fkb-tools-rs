@@ -1,20 +1,16 @@
 use ccfkb_lib::bin_utils::untransform_wsc_file_command;
-use ccfkb_lib::util::current_dir;
-use ccfkb_lib::{log, main_preamble};
+use ccfkb_lib::main_preamble;
+use ccfkb_lib::util::{entries_with_suffix, safe_create_dir};
+
 
 fn main() {
-	let files: Vec<_> = main_preamble!(file "WSC.txt").collect();
-	let out_parent_path = files.first().unwrap().parent().unwrap().file_name().unwrap();
-	let out_path = current_dir().join(out_parent_path).with_extension("yaml");
+	for script_dir in main_preamble!(dir ".arc.script") {
+		let yaml_dir = script_dir.with_extension("yaml");
+		safe_create_dir(&yaml_dir).unwrap();
 
-	if !std::fs::exists(&out_parent_path).unwrap() {
-		log::error!("Path {} does not exist", out_parent_path);
-		std::process::exit(1);
-	}
-
-	for file in files {
-		let yaml_path = out_path.join(file.with_extension("yaml").file_name().unwrap());
-		untransform_wsc_file_command(&yaml_path, &file);
+		for file in entries_with_suffix(&script_dir, ".WSC.txt").unwrap() {
+			let yaml_path = yaml_dir.join(file.file_name().unwrap()).with_extension("yaml");
+			untransform_wsc_file_command(&yaml_path, &file);
+		}
 	}
 }
-

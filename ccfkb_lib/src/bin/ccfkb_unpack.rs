@@ -9,7 +9,7 @@ use ccfkb_lib::{log, main_preamble};
 fn main() {
 	let top_out_path = current_dir().join("extracted_arcs");
 	safe_create_dir(&top_out_path).unwrap();
-	let files: Vec<_> = main_preamble!(file "arc").collect();
+	let files: Vec<_> = main_preamble!(file ".arc").collect();
 
 	for i in files {
 		let dirent = i;
@@ -29,14 +29,6 @@ fn main() {
 			filenames,
 			data 
 		} = read_arc(&mut file_contents[..], &out_folder_base, true);
-
-		let exts_yml_path = out_folder_base.join("extensions.yaml");
-		let exts_yml = serde_yml::to_string(&extensions).unwrap();
-		std::fs::write(&exts_yml_path, &exts_yml).unwrap();
-
-		let files_yml_path = out_folder_base.join("files.yaml");
-		let files_yml = serde_yml::to_string(&files).unwrap();
-		std::fs::write(&files_yml_path, &files_yml).unwrap();
 
 		let output_file_paths: Vec<_> = filenames
 			.iter()

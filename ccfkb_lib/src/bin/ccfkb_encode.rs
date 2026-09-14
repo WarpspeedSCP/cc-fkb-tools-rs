@@ -1,21 +1,15 @@
 use ccfkb_lib::bin_utils::encode_wsc_file_command;
 use ccfkb_lib::main_preamble;
-use ccfkb_lib::util::current_dir;
-use std::fs::create_dir_all;
+use ccfkb_lib::util::{entries_with_suffix, safe_create_dir};
+
 
 fn main() {
-	let files = main_preamble!(file "WSC.yaml").collect::<Vec<_>>();
+	for yaml_dir in main_preamble!(dir ".arc.yaml") {
+		let arc_dir = yaml_dir.with_extension("");
+		safe_create_dir(&arc_dir).unwrap();
 
-	let output_folder = files.first().unwrap().parent().unwrap().file_name().unwrap();
-
-	let out_dir_path = current_dir().join(output_folder);
-	create_dir_all(&out_dir_path).unwrap();
-
-	for file in files {
-		if !file.extension().unwrap().ends_with("yaml") {
-			continue;
+		for file in entries_with_suffix(&yaml_dir, ".WSC.yaml").unwrap() {
+			encode_wsc_file_command(&file, &arc_dir);
 		}
-		encode_wsc_file_command(&file, &out_dir_path)
 	}
 }
-

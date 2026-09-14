@@ -436,22 +436,6 @@ pub fn arc_entries(arc_dir: &Utf8Path) -> std::io::Result<Vec<Utf8PathBuf>> {
 	Ok(entries)
 }
 
-/// Resolves the descriptor-ordered on-disk paths inside `arc_dir` (e.g. `Chip.arc/BGM_P1G.WIP`),
-/// following the extension/file descriptor order recorded at unpack time.
-pub fn descriptor_paths(arc_dir: &Utf8Path, extensions: &[ExtensionDescriptor], files: &[FileDescriptor]) -> Vec<Utf8PathBuf> {
-	let mut paths = vec![];
-	let mut file_iter = files.iter();
-	for ExtensionDescriptor { name: ext, number, .. } in extensions {
-		for _ in 0..*number {
-			match file_iter.next() {
-				Some(file_desc) => paths.push(arc_dir.join(format!("{}.{}", file_desc.name, ext))),
-				None => log::warn!("No more file descriptors left for extension {ext}!"),
-			}
-		}
-	}
-	paths
-}
-
 /// Serializes an arc from `input_files` + descriptors and writes it to `output_path`.
 pub fn pack_arc(output_path: &Utf8Path, input_files: &[Utf8PathBuf], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> std::io::Result<()> {
 	let output = write_arc(input_files, extensions, files);

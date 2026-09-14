@@ -49,6 +49,19 @@ pub fn ends_with_ignore_case(a: &dyn AsRef<str>, b: &dyn AsRef<str>) -> bool {
 	a.as_ref().ends_with(b.as_ref()) || a.as_ref().to_ascii_uppercase().ends_with(&b.as_ref().to_ascii_uppercase())
 }
 
+/// Entries of `dir` whose file name ends with `suffix` (case-insensitive), sorted.
+pub fn entries_with_suffix(dir: &camino::Utf8Path, suffix: &str) -> std::io::Result<Vec<camino::Utf8PathBuf>> {
+	let mut entries = vec![];
+	for entry in dir.read_dir_utf8()? {
+		let entry = entry?;
+		if ends_with_ignore_case(&entry.file_name(), &suffix) {
+			entries.push(entry.path().to_owned());
+		}
+	}
+	entries.sort();
+	Ok(entries)
+}
+
 pub fn escape_str(input: &str, add_suffix: bool) -> String {
 	(input.to_string() + if add_suffix { "%K%P" } else { "" })
 		.replace("\\", "<bslash/>")

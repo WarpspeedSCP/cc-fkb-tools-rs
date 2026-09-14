@@ -3,7 +3,7 @@ use ccfkb_lib::data::{read_arc, ArcContents};
 use ccfkb_lib::main_preamble;
 
 fn main() {
-	let files = main_preamble!(dir "ARC");
+	let files = main_preamble!(file ".arc");
 
 	std::fs::create_dir_all("extracted_arcs").unwrap();
 
@@ -21,16 +21,11 @@ fn main() {
 			data
 		} = read_arc(&mut file_contents[..], &path, true);
 
-		let exts_yml_path = path.join("extensions.yml");
-		let exts_yml = serde_yml::to_string(&exts).unwrap();
-		std::fs::write(&exts_yml_path, &exts_yml).unwrap();
-
-		let files_yml_path = path.join("files.yml");
-		let files_yml = serde_yml::to_string(&files).unwrap();
-		std::fs::write(&files_yml_path, &files_yml).unwrap();
-
 		for (filename, content) in filenames.iter().zip(&data) {
 			let out_path = path.join(filename);
+			if out_path.exists() {
+				continue;
+			}
 			std::fs::write(out_path, content).unwrap();
 		}
 	}
