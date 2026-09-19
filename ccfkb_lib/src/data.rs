@@ -893,7 +893,7 @@ mod test {
 
 	#[test]
 	fn lz77_matches_original_entries() {
-		let root = "/home/wscp/RustroverProjects/cc-fkb-tools-rs";
+		let root = ".";
 		let file = "BGM_P1G.WIP";
 		let content = std::fs::read(format!("{root}/{file}")).unwrap();
 		let header = WIPFHeader::from_ref(&content);
@@ -925,13 +925,13 @@ mod test {
 
 	#[test]
 	fn wipf_roundtrip_8bit() {
-		let input = Utf8PathBuf::from("/home/wscp/RustroverProjects/cc-fkb-tools-rs/extracted_arcs/Chip.arc/EVCC0020A.MOS");
+		let input = Utf8PathBuf::from("./extracted_arcs/Chip.arc/EVCC0020A.MOS");
 		roundtrip_dir(&input, "EVCC0020A.MOS", &Utf8PathBuf::from("/tmp/wipf_rt_8"));
 	}
 
 	#[test]
 	fn wipf_roundtrip_24bit() {
-		let root = "/home/wscp/RustroverProjects/cc-fkb-tools-rs";
+		let root = ".";
 		let orig = std::fs::read(format!("{root}/BGM_P1G.WIP")).unwrap();
 		let extract_dir = Utf8PathBuf::from("/tmp/wipf_rt_24/BGM_P1G.WIP");
 		let _ = std::fs::remove_dir_all(&extract_dir);
