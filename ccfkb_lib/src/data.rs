@@ -464,7 +464,18 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 	files_to_pack.sort();
 	let depth = files_to_pack
 		.first()
-		.map(|it| std::fs::read(it).map(|bmp| BMPDibV3Header::from(&bmp[14..(14 + 40)]).depth))
+		.map(|it| {
+			std::fs::read(it).and_then(|bmp| {
+				if bmp.len() < 14 + 40 {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						format!("BMP {it:?} is too small"),
+					));
+				}
+				let dib = BMPDibV3Header::from(&bmp[14..(14 + 40)]);
+				Ok(dib.depth)
+			})
+		})
 		.transpose()?
 		.unwrap_or(24);
 	let depth_is_8 = depth == 8;
@@ -483,26 +494,109 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 		let path = Utf8Path::from_path(&file).unwrap();
 		let (_, (_, _, x, y)) = parse_file_name(file_name, path.file_name().unwrap()).unwrap();
 
-		let bmp = std::fs::read(file)?;
+		let bmp = std::fs::read(path)?;
 
+		if bmp.len() < 14 + 40 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("BMP {path} is too small"),
+			));
+		}
+
+		let bmp_header = BMPHeader::from(&bmp[..14]);
 		let dib_header = BMPDibV3Header::from(&bmp[14..(14 + 40)]);
+		let bmp_width = dib_header.width;
+		let bmp_height = dib_header.height;
+		let bmp_depth = dib_header.depth;
+		let wipf_depth = header.depth;
 
-		let mut entry = WIPFENTRY::new(dib_header.width, dib_header.height, x, y, dib_header.width * dib_header.height * (header.depth / 8) as u32);
+		if bmp_depth != 8 && bmp_depth != 24 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("BMP {path} has unsupported depth {bmp_depth}"),
+			));
+		}
 
-		let entry_data = &bmp[(14 + 40)..];
+		if bmp_depth != wipf_depth {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"BMP {path} has depth {} but WIPF depth is {}",
+					bmp_depth, wipf_depth
+				),
+			));
+		}
 
-		let compression_data = if depth_is_8 { &entry_data[0x400..] } else { entry_data };
+		// BMP files written by modern image editors may use a BITMAPV5HEADER
+		// (or another extended DIB header), so the palette/pixel data do not
+		// necessarily start at 14 + 40. Honour the DIB header size and the
+		// file header's bfOffBits field instead of hardcoding the V3 layout.
+		let dib_size = u32::from_le_bytes(bmp[14..18].try_into().unwrap()) as usize;
+		let palette_start = 14usize.checked_add(dib_size).ok_or_else(|| {
+			std::io::Error::new(std::io::ErrorKind::InvalidData, "BMP DIB size overflow")
+		})?;
+		let pixel_offset = bmp_header.offset as usize;
 
-		let row_size = ((entry.width * (header.depth / 8) as u32)).next_multiple_of(4);
+		if pixel_offset > bmp.len() || palette_start > pixel_offset {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("BMP {path} has invalid palette/pixel offsets"),
+			));
+		}
 
-		let entry_data_flip_iter = compression_data.rchunks_exact(row_size as usize);
+		let bytes_per_pixel = (bmp_depth / 8) as usize;
+		let row_size = (bmp_width as usize)
+			.checked_mul(bytes_per_pixel)
+			.and_then(|it| it.checked_add(3))
+			.map(|it| it & !3)
+			.ok_or_else(|| {
+				std::io::Error::new(std::io::ErrorKind::InvalidData, "BMP row size overflow")
+			})?;
+		let pixel_len = row_size
+			.checked_mul(bmp_height as usize)
+			.ok_or_else(|| {
+				std::io::Error::new(std::io::ErrorKind::InvalidData, "BMP pixel data size overflow")
+			})?;
+		let pixel_end = pixel_offset.checked_add(pixel_len).ok_or_else(|| {
+			std::io::Error::new(std::io::ErrorKind::InvalidData, "BMP pixel data end overflow")
+		})?;
+
+		if pixel_end > bmp.len() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"BMP {path} is truncated: pixel data ends at 0x{pixel_end:X}, file is 0x{:X} bytes",
+					bmp.len()
+				),
+			));
+		}
+
+		let pixel_data = &bmp[pixel_offset..pixel_end];
+		let palette = if depth_is_8 {
+			let mut palette = vec![0u8; 0x400];
+			let palette_src = &bmp[palette_start..pixel_offset];
+			let copy_len = palette.len().min(palette_src.len());
+			palette[..copy_len].copy_from_slice(&palette_src[..copy_len]);
+			palette
+		} else {
+			vec![]
+		};
+
+		let mut entry = WIPFENTRY::new(
+			bmp_width,
+			bmp_height,
+			x,
+			y,
+			bmp_width * bmp_height * (bmp_depth / 8) as u32,
+		);
+
 		let entry_out_buffer = if !depth_is_8 {
 			let clr_len = entry.width as usize * entry.height as usize;
-			let mut entry_out_buffer = vec![0u8; entry_data.len()];
+			let mut entry_out_buffer = vec![0u8; clr_len * 3];
 			let (r_plane, rest) = entry_out_buffer.split_at_mut(clr_len);
 			let (g_plane, b_plane) = rest.split_at_mut(clr_len);
 
-			for (row_index, rgb_row) in entry_data_flip_iter.enumerate() {
+			for (row_index, rgb_row) in pixel_data.rchunks_exact(row_size).enumerate() {
 				let base = row_index * entry.width as usize;
 				let (data, _) = rgb_row.as_chunks();
 				for (index, &[r, g, b]) in data.iter().enumerate() {
@@ -513,14 +607,17 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 			}
 			lz77_compress(&entry_out_buffer)
 		} else {
-			lz77_compress(&entry_data_flip_iter.flatten().copied().collect::<Vec<u8>>())
+			let raw_pixels = pixel_data
+				.rchunks_exact(row_size)
+				.flatten()
+				.copied()
+				.collect::<Vec<u8>>();
+			lz77_compress(&raw_pixels)
 		};
 
 		entry.length = entry_out_buffer.len() as u32;
 
 		let entry_final_data = if depth_is_8 {
-			// copy palette over from the bitmap.
-			let palette = &entry_data[..0x400];
 			palette.iter().copied().chain(entry_out_buffer).collect()
 		} else {
 			entry_out_buffer
@@ -650,6 +747,86 @@ mod test {
 		let mut content = orig.clone();
 		do_extract_wipf("BGM_P1G.WIP", &extract_dir, &mut content).unwrap();
 		roundtrip_dir(&extract_dir, "BGM_P1G.WIP", &Utf8PathBuf::from("/tmp/wipf_rt_24_out/BGM_P1G.WIP"));
+	}
+
+	#[test]
+	fn wipf_pack_honours_v5_bmp_header() {
+		fn put_u16(buf: &mut [u8], off: usize, value: u16) {
+			buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+		}
+
+		fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+			buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+		}
+
+		// Classic 24-bit BMP with a 40-byte BITMAPINFOHEADER and bfOffBits = 54.
+		fn make_v3_bmp(width: usize, height: usize) -> Vec<u8> {
+			let row_size = (width * 3).next_multiple_of(4);
+			let pixel_len = row_size * height;
+			let mut bmp = vec![0u8; 14 + 40 + pixel_len];
+
+			bmp[0] = b'B';
+			bmp[1] = b'M';
+			let bmp_len = bmp.len() as u32;
+			put_u32(&mut bmp, 2, bmp_len);
+			put_u32(&mut bmp, 10, 54);
+			put_u32(&mut bmp, 14, 40);
+			put_u32(&mut bmp, 18, width as u32);
+			put_u32(&mut bmp, 22, height as u32);
+			put_u16(&mut bmp, 26, 1);
+			put_u16(&mut bmp, 28, 24);
+			put_u32(&mut bmp, 34, pixel_len as u32);
+
+			for (index, byte) in bmp[54..].iter_mut().enumerate() {
+				*byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+			}
+			bmp
+		}
+
+		// Simulate GIMP's BITMAPV5HEADER: 84 extra DIB bytes and bfOffBits = 138.
+		fn make_v5_bmp(v3: &[u8]) -> Vec<u8> {
+			let mut v5 = v3.to_vec();
+			let extra = 124 - 40;
+			v5.splice(54..54, std::iter::repeat(0u8).take(extra));
+			let v5_len = v5.len() as u32;
+			put_u32(&mut v5, 2, v5_len);
+			put_u32(&mut v5, 10, 138);
+			put_u32(&mut v5, 14, 124);
+			v5
+		}
+
+		let root = Utf8PathBuf::from("/tmp/wipf_v5_test");
+		let _ = std::fs::remove_dir_all(&root);
+
+		let v3_dir = root.join("v3").join("CFGALPHA.WIP");
+		let v5_dir = root.join("v5").join("CFGALPHA.WIP");
+		std::fs::create_dir_all(&v3_dir).unwrap();
+		std::fs::create_dir_all(&v5_dir).unwrap();
+
+		let filename = "CFGALPHA.WIP_000-d24+0x0y.bmp";
+		let v3 = make_v3_bmp(4, 4);
+		let v5 = make_v5_bmp(&v3);
+		std::fs::write(v3_dir.join(filename), &v3).unwrap();
+		std::fs::write(v5_dir.join(filename), &v5).unwrap();
+
+		let packed_v3 = do_pack_wipf(&v3_dir).unwrap();
+		let packed_v5 = do_pack_wipf(&v5_dir).unwrap();
+		assert_eq!(packed_v3, packed_v5, "V5 and V3 BMPs must produce identical WIPF data");
+
+		let header = WIPFHeader::from_ref(&packed_v5);
+		let depth = header.depth;
+		let n_entries = header.n_entries as usize;
+		assert_eq!(depth, 24);
+		let entries = WIPFENTRY::from_ref_as_slice(
+			&packed_v5[std::mem::size_of_val(header)..],
+			n_entries,
+		);
+		assert_eq!(entries.len(), 1);
+		let data_start = std::mem::size_of_val(header) + std::mem::size_of_val(entries);
+		let payload = &packed_v5[data_start..];
+		let out_len = 4 * 4 * 3;
+		let decoded = crate::util::lz77_decompress(payload, out_len);
+		assert_eq!(decoded.len(), out_len);
 	}
 }
 
