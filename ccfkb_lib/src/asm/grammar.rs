@@ -21,7 +21,7 @@ use nom::{IResult, Offset, Parser};
 
 use crate::opcodes::{Code, OpField, OpcodeSpecStatic, TLString};
 
-use super::{is_jump_field, operand_labels};
+use super::{is_jump_field, operand_labels, ConstantTable, ResolvedValue};
 
 /// The message a parser uses where the caller owns the wording: the line classifiers replace it with
 /// the `unrecognized line` diagnostic, which only they can spell (they hold the line's text).
@@ -129,6 +129,24 @@ pub(crate) fn word(input: &str) -> PResult<'_, &str> {
 	take_while1(|c: char| c.is_ascii_alphanumeric() || c == '_').parse(input)
 }
 
+/// Whether a value token is a constant name rather than a literal: it starts with a letter or `_` and
+/// continues with letters, digits or `_`. This is the one predicate the name check, the definition
+/// parser and every operand value share, and it is deliberately *not* [`word`] — a mnemonic may start
+/// with a digit, a constant name may not.
+pub(crate) fn is_identifier(token: &str) -> bool {
+	let mut chars = token.chars();
+	match chars.next() {
+		Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+		_ => return false,
+	}
+	chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The message for a constant whose kind is not the one the operand needs.
+fn wrong_kind(label: &str, needs: &str, name: &str, kind: &str) -> String {
+	format!("operand \"{label}\" needs {needs}; \"{name}\" is a {kind} constant")
+}
+
 /// A `;` comment: the text after the `;`, to the end of the line.
 pub(crate) fn line_comment(input: &str) -> PResult<'_, &str> {
 	preceded(char(';'), rest).parse(input)
@@ -209,15 +227,23 @@ fn hex_prefix(input: &str) -> PResult<'_, &str> {
 	alt((tag("0x"), tag("0X"))).parse(input)
 }
 
-/// A `0x…` literal of exactly `digits` hex digits, all of it. The operand's label is named in both
-/// messages, so this is the parser that owns the width and digit-count wording:
+/// A `0x…` literal of exactly `digits` hex digits, all of it — or, when the token is a constant name,
+/// that constant's value. The operand's label is named in both messages, so this is the parser that
+/// owns the width and digit-count wording:
 ///
 /// * not a `0x…` literal at all, or a literal of the wrong width, or a bare `0x` → `takes {width}`;
 /// * a body with a character that is not a hex digit → `needs {digits} hex digits after "0x"`.
+///
+/// A constant resolves through [`ConstantTable::resolve`]: a number is the value, an address is taken
+/// as its low bytes with a finding pushed on `flags` (an engine address in a numeric operand is
+/// probably a mistake), a text constant is a kind mismatch, and an unknown name or an alias cycle is
+/// the table's own message.
 pub(crate) fn hex_value<'l, 'i>(
 	label: &'l str,
 	digits: usize,
 	width: &'static str,
+	constants: &'l ConstantTable,
+	flags: &'l mut Vec<DecodedFlag<'i>>,
 ) -> impl Parser<&'i str, Output = u32, Error = AsmError<'i>> + 'l {
 	move |input: &'i str| {
 		let token = input.trim();
@@ -235,6 +261,28 @@ pub(crate) fn hex_value<'l, 'i>(
 				),
 			)
 		};
+		if is_identifier(token) {
+			return match constants.resolve(token) {
+				Ok(ResolvedValue::Number { value, .. }) if value < 1u64 << (4 * digits) => {
+					Ok(("", value as u32))
+				}
+				Ok(ResolvedValue::Number { value, .. }) => fail(
+					input,
+					format!("constant \"{token}\" is 0x{value:X}, which does not fit {width}"),
+				),
+				Ok(ResolvedValue::Address(value)) => {
+					flags.push(DecodedFlag {
+						input,
+						message: format!(
+							"address constant \"{token}\" used as a numeric operand value"
+						),
+					});
+					Ok(("", value as u32))
+				}
+				Ok(ResolvedValue::Text(_)) => fail(input, wrong_kind(label, width, token, "text")),
+				Err(message) => fail(input, message),
+			};
+		}
 		let Ok((body, _)) = hex_prefix(token) else {
 			return wrong_width();
 		};
@@ -259,13 +307,16 @@ pub(crate) fn hex_value<'l, 'i>(
 pub(crate) fn padding_value<'l, 'i>(
 	label: &'l str,
 	size: u8,
+	constants: &'l ConstantTable,
+	flags: &'l mut Vec<DecodedFlag<'i>>,
 ) -> impl Parser<&'i str, Output = Vec<u8>, Error = AsmError<'i>> + 'l {
 	move |input: &'i str| {
 		if size == 1 {
-			let (rest, byte) = hex_value(label, 2, "a 1-byte hex literal").parse(input)?;
+			let (rest, byte) =
+				hex_value(label, 2, "a 1-byte hex literal", constants, flags).parse(input)?;
 			return Ok((rest, vec![byte as u8]));
 		}
-		let (rest, bytes) = byte_list_value(input)?;
+		let (rest, bytes) = byte_list_value(input, constants)?;
 		if bytes.len() != size as usize {
 			return fail(
 				input,
@@ -292,6 +343,29 @@ pub(crate) fn string_value(input: &str) -> PResult<'_, String> {
 	match unescape(token) {
 		Ok(text) => Ok((rest, text)),
 		Err(message) => fail(input, message),
+	}
+}
+
+/// A `"…"` literal's value, or the text of a constant that declares one: the parser behind a `s`
+/// operand. A token that is not an identifier goes through [`string_value`], so the literal's own
+/// messages are the ones reported; a constant that declares a number or an address is a kind
+/// mismatch, and an unknown name or an alias cycle is [`ConstantTable::resolve`]'s own message.
+pub(crate) fn string_operand<'l, 'i>(
+	label: &'l str,
+	constants: &'l ConstantTable,
+) -> impl Parser<&'i str, Output = String, Error = AsmError<'i>> + 'l {
+	move |input: &'i str| {
+		let token = input.trim();
+		if !is_identifier(token) {
+			return string_value(input);
+		}
+		match constants.resolve(token) {
+			Ok(ResolvedValue::Text(text)) => Ok(("", text)),
+			Ok(ResolvedValue::Number { .. } | ResolvedValue::Address(_)) => {
+				fail(input, wrong_kind(label, "a string", token, "number"))
+			}
+			Err(message) => fail(input, message),
+		}
 	}
 }
 
@@ -339,18 +413,53 @@ fn brackets(input: &str) -> PResult<'_, &str> {
 	delimited(char('['), take_while(|c: char| c != ']'), char(']')).parse(input)
 }
 
-/// One `0xNN` item of a byte list.
-fn byte_item(input: &str) -> PResult<'_, u8> {
+/// One `0xNN` item of a byte list, or the name of a constant that resolves to one byte.
+fn byte_item<'a>(input: &'a str, constants: &ConstantTable) -> PResult<'a, u8> {
+	if is_identifier(input) {
+		let (rest, _) = word(input)?;
+		return match constants.resolve(input) {
+			Ok(ResolvedValue::Number { value, .. }) if value <= u8::MAX as u64 => {
+				Ok((rest, value as u8))
+			}
+			Ok(ResolvedValue::Number { value, .. }) => fail(
+				input,
+				format!(
+					"constant \"{input}\" is 0x{value:X}, which does not fit a 1-byte hex literal"
+				),
+			),
+			Ok(ResolvedValue::Address(value)) if value <= u8::MAX as usize => {
+				Ok((rest, value as u8))
+			}
+			Ok(ResolvedValue::Address(value)) => fail(
+				input,
+				format!(
+					"constant \"{input}\" is @0x{value:08X}, which does not fit a 1-byte hex literal"
+				),
+			),
+			// An item that is not a byte at all keeps the list's own wording, like every other item
+			// the list cannot read.
+			Ok(ResolvedValue::Text(_)) => {
+				Err(nom::Err::Error(AsmError::from_error_kind(input, ErrorKind::Tag)))
+			}
+			Err(message) => fail(input, message),
+		};
+	}
 	map(
 		preceded(tag("0x"), take_while_m_n(2, 2, |c: char| c.is_ascii_hexdigit())),
 		|it: &str| u8::from_str_radix(it, 16).unwrap_or_default(),
-	).parse(input)
+	)
+	.parse(input)
+}
+
+/// [`byte_item`] as a parser value, so a list can hand it to `separated_list0`.
+fn byte_items<'c>(constants: &'c ConstantTable) -> impl FnMut(&str) -> PResult<'_, u8> + 'c {
+	move |input| byte_item(input, constants)
 }
 
 /// A `[ 0xNN, … ]` byte list, all of the value; `[ ]` is the empty list. The message names the text
 /// the caller passed in, so the trailer, a padding operand and a choice record all get the one
-/// wording the format documents.
-pub(crate) fn byte_list_value(input: &str) -> PResult<'_, Vec<u8>> {
+/// wording the format documents — except for an item that is a constant, whose own message is kept.
+pub(crate) fn byte_list_value<'a>(input: &'a str, constants: &ConstantTable) -> PResult<'a, Vec<u8>> {
 	let token = input.trim();
 	let malformed = || fail::<Vec<u8>>(input, format!("malformed byte list \"{token}\""));
 	let Ok((rest, inner)) = brackets(token) else {
@@ -363,9 +472,13 @@ pub(crate) fn byte_list_value(input: &str) -> PResult<'_, Vec<u8>> {
 	if inner.is_empty() {
 		return Ok((rest, Vec::new()));
 	}
-	let items = separated_list0(preceded(space, char(',')), preceded(space, byte_item));
+	let items = separated_list0(
+		preceded(space, char(',')),
+		preceded(space, byte_items(constants)),
+	);
 	match all_consuming(items).parse(inner) {
 		Ok((_, bytes)) => Ok((rest, bytes)),
+		Err(nom::Err::Failure(it)) if it.message != UNRECOGNIZED => Err(nom::Err::Failure(it)),
 		Err(_) => malformed(),
 	}
 }
@@ -454,13 +567,12 @@ pub(crate) fn annotation(input: &str) -> PResult<'_, (&str, &str)> {
 	Ok((rest, (key, rest.trim())))
 }
 
-/// A directive's name (after its `.`) and the text after it. The name is the longest of `.trailer`
-/// and an identifier, so `.trailerX` reads as the directive `trailer` and the text `X` — which is
-/// what makes the directive's own error message name the right text.
-pub(crate) fn directive(input: &str) -> PResult<'_, (&str, &str)> {
-	let (rest, _) = char('.').parse(input)?;
-	let (rest, name) = alt((tag("trailer"), word)).parse(rest)?;
-	Ok((rest, (name, rest)))
+/// A directive's name, after its `.`: `trailer` or any identifier. `.trailer` is the only directive
+/// the format ever had and it is retired — the caller reports it as renamed — so the name is all this
+/// returns and the text after it belongs to no rule any more. The name is the longest of `.trailer`
+/// and an identifier, so `.trailerX` reads as the directive `trailer`.
+pub(crate) fn directive(input: &str) -> PResult<'_, &str> {
+	preceded(char('.'), alt((tag("trailer"), word))).parse(input)
 }
 
 /// An instruction: its mnemonic and the operand region after it. Fails when the first token is not an
@@ -528,13 +640,21 @@ pub(crate) fn has_top_level_hash(input: &str) -> bool {
 
 // -- One instruction line against one table row ----------------------------------------------------
 
-/// One instruction line's decoded values, the label and slice of each operand (the driver turns the
-/// slices into positioned spans) and the tokens of its jump operands, which the driver fills in once
-/// every address is known.
+/// A finding a value parser produced while still succeeding: today, an address constant written in a
+/// numeric operand. The driver positions it like an error but reports it as a finding.
+pub(crate) struct DecodedFlag<'a> {
+	pub input: &'a str,
+	pub message: String,
+}
+
+/// One instruction line's decoded values, the label, operand slice and value token of each operand
+/// (the driver turns the slices into positioned spans and re-emits the tokens as written) and the
+/// tokens of its jump operands, which the driver fills in once every address is known.
 pub(crate) struct Decoded<'a> {
 	pub fields: Vec<OpField>,
-	pub spans: Vec<(String, &'a str)>,
+	pub spans: Vec<(String, &'a str, &'a str)>,
 	pub jump_tokens: Vec<(usize, &'a str)>,
+	pub flags: Vec<DecodedFlag<'a>>,
 }
 
 /// Parses one instruction line's operand region against one row of the opcode table. Which labels and
@@ -545,6 +665,7 @@ pub(crate) struct Decoded<'a> {
 /// never escapes.
 pub(crate) fn row_values<'a>(
 	spec: &'static OpcodeSpecStatic,
+	constants: &'a ConstantTable,
 ) -> impl Parser<&'a str, Output = Decoded<'a>, Error = AsmError<'a>> + 'a {
 	move |input: &'a str| {
 		let labels = operand_labels(spec.operands);
@@ -565,6 +686,7 @@ pub(crate) fn row_values<'a>(
 		let mut fields = Vec::with_capacity(spec.layout.len());
 		let mut spans = Vec::with_capacity(spec.layout.len());
 		let mut jump_tokens = Vec::new();
+		let mut flags: Vec<DecodedFlag<'a>> = Vec::new();
 		for (index, operand) in operands.iter().enumerate() {
 			let operand = operand.trim();
 			let label = &labels[index];
@@ -584,39 +706,49 @@ pub(crate) fn row_values<'a>(
 					),
 				);
 			}
-			spans.push((label.clone(), operand));
+			spans.push((label.clone(), operand, value));
 			let code = spec.layout[index];
 			if matches!(code, Code::Choice) && index + 1 < spec.layout.len() {
 				return fail(operand, "\"choices:\" must be the last operand on the line");
 			}
 			let field = match code {
 				Code::Byte => OpField::Byte(
-					hex_value(label, 2, "a 1-byte hex literal").parse(value)?.1 as u8,
+					hex_value(label, 2, "a 1-byte hex literal", constants, &mut flags)
+						.parse(value)?
+						.1 as u8,
 				),
 				Code::Word => OpField::Word(
-					hex_value(label, 4, "a 2-byte hex literal").parse(value)?.1 as u16,
+					hex_value(label, 4, "a 2-byte hex literal", constants, &mut flags)
+						.parse(value)?
+						.1 as u16,
 				),
 				Code::DWord => {
 					if is_jump_field(spec.opcode, index) {
 						jump_tokens.push((index, value));
 						OpField::DWord(0)
 					} else {
-						OpField::DWord(hex_value(label, 8, "a 4-byte hex literal").parse(value)?.1)
+						OpField::DWord(
+							hex_value(label, 8, "a 4-byte hex literal", constants, &mut flags)
+								.parse(value)?
+								.1,
+						)
 					}
 				}
 				Code::Str => OpField::String(TLString {
-					raw: string_value(value)?.1,
+					raw: string_operand(label, constants).parse(value)?.1,
 					translation: None,
 					notes: None,
 				}),
-				Code::Padding(size) => OpField::Padding(padding_value(label, size).parse(value)?.1),
+				Code::Padding(size) => {
+					OpField::Padding(padding_value(label, size, constants, &mut flags).parse(value)?.1)
+				}
 				// The records arrive on the lines that follow the instruction; the value here names
 				// nothing (the printer writes `choices:` with nothing after it).
 				Code::Choice => OpField::Choice(vec![]),
 			};
 			fields.push(field);
 		}
-		Ok(("", Decoded { fields, spans, jump_tokens }))
+		Ok(("", Decoded { fields, spans, jump_tokens, flags }))
 	}
 }
 
@@ -666,33 +798,39 @@ mod test {
 
 	#[test]
 	fn hex_value_messages() {
-		fn value(input: &str) -> PResult<'_, u32> {
-			hex_value("preset", 4, "a 2-byte hex literal").parse(input)
+		fn value(input: &str) -> Result<u32, String> {
+			let constants = ConstantTable::default();
+			let mut flags = Vec::new();
+			value_of(
+				hex_value("preset", 4, "a 2-byte hex literal", &constants, &mut flags).parse(input),
+			)
 		}
-		assert_eq!(value_of(value("0x0114")), Ok(0x0114));
-		assert_eq!(value_of(value("0X0114")), Ok(0x0114));
+		assert_eq!(value("0x0114"), Ok(0x0114));
+		assert_eq!(value("0X0114"), Ok(0x0114));
 		assert_eq!(
-			value_of(value("0x777")),
+			value("0x777"),
 			Err("operand \"preset\" takes a 2-byte hex literal, found \"0x777\"".to_owned())
 		);
 		assert_eq!(
-			value_of(value("777")),
+			value("777"),
 			Err("operand \"preset\" takes a 2-byte hex literal, found \"777\"".to_owned())
 		);
 		assert_eq!(
-			value_of(value("0x")),
+			value("0x"),
 			Err("operand \"preset\" takes a 2-byte hex literal, found \"0x\"".to_owned())
 		);
 		assert_eq!(
-			value_of(value("0xZZ")),
+			value("0xZZ"),
 			Err("operand \"preset\" needs 4 hex digits after \"0x\", found \"0xZZ\"".to_owned())
 		);
 		assert_eq!(
-			value_of(value("0x0114junk")),
+			value("0x0114junk"),
 			Err("operand \"preset\" needs 4 hex digits after \"0x\", found \"0x0114junk\"".to_owned())
 		);
 		// The failure points at the value token, not at the operand's label.
-		match value("0x777") {
+		let constants = ConstantTable::default();
+		let mut flags = Vec::new();
+		match hex_value("preset", 4, "a 2-byte hex literal", &constants, &mut flags).parse("0x777") {
 			Err(nom::Err::Failure(it)) => assert_eq!(it.input, "0x777"),
 			other => panic!("expected a positioned failure, got {other:?}"),
 		}
@@ -729,18 +867,23 @@ mod test {
 
 	#[test]
 	fn byte_list_and_padding() {
-		assert_eq!(value_of(byte_list_value("[ ]")), Ok(vec![]));
-		assert_eq!(value_of(byte_list_value("[ 0x00, 0x01 ]")), Ok(vec![0x00, 0x01]));
-		assert_eq!(value_of(byte_list_value("[0x00,0x01]")), Ok(vec![0x00, 0x01]));
+		let constants = ConstantTable::default();
+		fn padding(size: u8, input: &str) -> Result<Vec<u8>, String> {
+			let constants = ConstantTable::default();
+			let mut flags = Vec::new();
+			value_of(padding_value("pad", size, &constants, &mut flags).parse(input))
+		}
+		assert_eq!(value_of(byte_list_value("[ ]", &constants)), Ok(vec![]));
+		assert_eq!(value_of(byte_list_value("[ 0x00, 0x01 ]", &constants)), Ok(vec![0x00, 0x01]));
+		assert_eq!(value_of(byte_list_value("[0x00,0x01]", &constants)), Ok(vec![0x00, 0x01]));
 		for malformed in ["[ 0x00, 0x01", "[ 0x00, 0x01 ] junk", "[ 0X00 ]", "[ 0x000 ]", "[ 0x00, ]"] {
 			assert_eq!(
-				value_of(byte_list_value(malformed)),
+				value_of(byte_list_value(malformed, &constants)),
 				Err(format!("malformed byte list \"{malformed}\"")),
 				"{malformed}"
 			);
 		}
 
-		let padding = |size: u8, input: &str| value_of(padding_value("pad", size).parse(input));
 		assert_eq!(padding(1, "0x00"), Ok(vec![0x00]));
 		assert_eq!(
 			padding(1, "[ 0x00 ]"),
@@ -783,9 +926,9 @@ mod test {
 		assert_eq!(value_of(annotation("#")), Ok(("", "")));
 		assert_eq!(value_of(annotation("#  spaced   out  ")), Ok(("spaced", "out")));
 
-		assert_eq!(value_of(directive(".trailer [ ]")), Ok(("trailer", " [ ]")));
-		assert_eq!(value_of(directive(".trailerX")), Ok(("trailer", "X")));
-		assert_eq!(value_of(directive(".foo bar")), Ok(("foo", " bar")));
+		assert_eq!(value_of(directive(".trailer [ ]")), Ok("trailer"));
+		assert_eq!(value_of(directive(".trailerX")), Ok("trailer"), "the name ends with the tag");
+		assert_eq!(value_of(directive(".foo bar")), Ok("foo"));
 		assert!(directive(".").is_err(), "a lone dot is not a directive");
 
 		assert_eq!(value_of(instruction("nop")), Ok(("nop", "")));

@@ -11,20 +11,29 @@
 //! choice blocks, the trailer, and `# translation` annotations, which apply positionally to an
 //! instruction's string operands.
 //!
+//! It also resolves the constants layer: the `include` annotations of the script are followed before
+//! its lines are read (see [`Loader`]), so every value token may spell a name from a `.inc` file
+//! instead of a literal. Diagnostics carry the source file they belong to, so a problem inside an
+//! included file is reported against that file and not against the script.
+//!
 //! Parsing never fails and never panics: a malformed line becomes diagnostics the caller can note, so
 //! an editor can be served on partial input.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
+use anyhow::Context;
+use camino::{Utf8Path, Utf8PathBuf};
 use nom::Parser;
 
 use crate::opcodes::{Code, Choice, OpField, Opcode, OpcodeSpecStatic, Script, TLString, OPCODE_SPECS};
 
-use super::grammar::{self, AsmError, JumpTarget, LineShape};
-use super::print::MAGIC;
+use super::grammar::{self, AsmError, DecodedFlag, JumpTarget, LineShape};
+use super::print::{CONST_MAGIC, MAGIC};
 use super::{
-	finish_manifest, is_jump_field, jump_field, AsmDocument, AsmItem, Comment, CommentAnchor,
-	Diagnostic, Severity,
+	escape_string, finish_manifest, is_jump_field, jump_field, AsmDocument, AsmItem, AsmOperand,
+	Comment, CommentAnchor, Constant, ConstantTable, ConstantValue, Diagnostic, Include, Severity,
+	Source, SourceKind,
 };
 
 /// A jump operand whose value can only be filled once every instruction address is known.
@@ -58,8 +67,10 @@ pub enum LineKind<'a> {
 	Blank,
 	/// An annotation: its key and value as written, and the 1-based column of its `#`.
 	Annotation { key: &'a str, value: &'a str, column: usize },
-	/// The `.trailer` directive, and the text after the directive's name.
-	Directive { rest: &'a str },
+	/// A `.`-led directive. `.trailer` is the only directive the format ever had and it is retired in
+	/// favour of the `#trailer` annotation, so this carries nothing: the driver reports the line as
+	/// renamed.
+	Directive,
 	/// An instruction line: its mnemonic, and its operand region (everything after the mnemonic).
 	Instruction { mnemonic: &'a str, operands: &'a str },
 	/// A choice record line: its text, and its comma-separated operands. The driver splits each
@@ -117,7 +128,7 @@ pub fn parse_line(input: &str, line: usize) -> LineParse<'_> {
 			}
 		},
 		LineShape::Directive => match grammar::directive(trimmed) {
-			Ok((_, (name, rest))) if name == "trailer" => LineKind::Directive { rest },
+			Ok((_, "trailer")) => LineKind::Directive,
 			_ => {
 				diagnostics.push(unrecognized(line, trimmed));
 				LineKind::Bad
@@ -161,13 +172,23 @@ pub fn parse_line(input: &str, line: usize) -> LineParse<'_> {
 
 /// Parses an `.asm` file. The result always holds the script that could be read plus every problem
 /// found; [`AsmDocument::has_errors`] decides whether that script may be assembled.
-pub fn parse_document(text: &str) -> AsmDocument {
+///
+/// `path` is the file's location: it is what `include` paths resolve from and what becomes
+/// `sources[0].path`. It is never read from disk — an editor buffer is enough.
+pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
+	let mut loader = Loader::new(path);
+	loader.load_script(text, path);
+	let constants = std::mem::take(&mut loader.constants);
 	let mut out = AsmDocument {
 		script: Script { opcode_table: vec![], opcodes: vec![], trailer: vec![] },
 		items: vec![],
 		labels: BTreeMap::new(),
 		comments: vec![],
-		diagnostics: vec![],
+		diagnostics: std::mem::take(&mut loader.errors),
+		// Filled at the end: the loop needs the table on its own while it mutates the document.
+		constants: ConstantTable::default(),
+		sources: std::mem::take(&mut loader.sources),
+		includes: std::mem::take(&mut loader.includes),
 	};
 	let mut pending = PendingAnnotations::default();
 	let mut label_lines: BTreeMap<String, usize> = BTreeMap::new();
@@ -214,23 +235,22 @@ pub fn parse_document(text: &str) -> AsmDocument {
 		match parsed.kind {
 			LineKind::Blank | LineKind::Bad | LineKind::RejectedRecord => {}
 			LineKind::Annotation { key, value, column } => {
-				parse_annotation(&mut out, &mut pending, number, column, key, value);
+				parse_annotation(
+					&mut out,
+					&mut pending,
+					&constants,
+					&mut trailer_line,
+					number,
+					column,
+					key,
+					value,
+				);
 			}
-			LineKind::Directive { rest } => {
-				if let Some(first) = trailer_line {
-					out.diagnostics.push(error(
-						number,
-						1,
-						format!("duplicate \".trailer\" directive (first on line {first})"),
-					));
-				} else {
-					trailer_line = Some(number);
-					match grammar::value_of(grammar::byte_list_value(rest)) {
-						Ok(bytes) => out.script.trailer = bytes,
-						Err(message) => out.diagnostics.push(error(number, 1, message)),
-					}
-				}
-			}
+			LineKind::Directive => out.diagnostics.push(error(
+				number,
+				1,
+				"\".trailer\" is now \"#trailer\"".to_owned(),
+			)),
 			LineKind::RejectedInstruction { ends_choice_block } => {
 				if ends_choice_block {
 					choice_slot = None;
@@ -244,30 +264,36 @@ pub fn parse_document(text: &str) -> AsmDocument {
 						1,
 						"choice record with no preceding \"choices:\" block".to_owned(),
 					)),
-					Some((opcode_index, field_index)) => match choice_record(text, &segments) {
-						Ok(choice) => {
-							if choice.trailer.len() != 11 {
-								out.diagnostics.push(flag(
-									number,
-									1,
-									format!(
-										"choice trailer is {} bytes; the decoder always reads 11",
-										choice.trailer.len()
-									),
-								));
+					Some((opcode_index, field_index)) => {
+						let mut findings = Vec::new();
+						match choice_record(text, &segments, &constants, &mut findings) {
+							Ok(choice) => {
+								if choice.trailer.len() != 11 {
+									out.diagnostics.push(flag(
+										number,
+										1,
+										format!(
+											"choice trailer is {} bytes; the decoder always reads 11",
+											choice.trailer.len()
+										),
+									));
+								}
+								if let OpField::Choice(choices) =
+									&mut out.script.opcodes[opcode_index].fields[field_index]
+								{
+									// The instruction line sized the choice list as empty; the records
+									// arrive on the lines that follow, so the running address has to grow
+									// with them.
+									address += choice.size();
+									choices.push(choice);
+								}
 							}
-							if let OpField::Choice(choices) =
-								&mut out.script.opcodes[opcode_index].fields[field_index]
-							{
-								// The instruction line sized the choice list as empty; the records
-								// arrive on the lines that follow, so the running address has to grow
-								// with them.
-								address += choice.size();
-								choices.push(choice);
-							}
+							Err(message) => out.diagnostics.push(error(number, 1, message)),
 						}
-						Err(message) => out.diagnostics.push(error(number, 1, message)),
-					},
+						for finding in findings {
+							out.diagnostics.push(finding_at(raw, number, finding));
+						}
+					}
 				}
 			}
 			LineKind::Instruction { mnemonic, operands } => {
@@ -289,7 +315,14 @@ pub fn parse_document(text: &str) -> AsmDocument {
 				let mut attempts: Vec<(&OpcodeSpecStatic, Result<grammar::Decoded, AsmError>)> =
 					candidates
 						.iter()
-						.map(|spec| (*spec, grammar::finished(grammar::row_values(spec).parse(operands))))
+						.map(|spec| {
+							(
+								*spec,
+								grammar::finished(
+									grammar::row_values(spec, &constants).parse(operands),
+								),
+							)
+						})
 						.collect();
 				let decoded_rows = attempts.iter().filter(|(_, it)| it.is_ok()).count();
 				let index = match (attempts.len(), decoded_rows) {
@@ -329,6 +362,9 @@ pub fn parse_document(text: &str) -> AsmDocument {
 					}
 				};
 				let mut fields = decoded.fields;
+				for finding in decoded.flags {
+					out.diagnostics.push(finding_at(raw, number, finding));
+				}
 				let opcode_index = out.script.opcodes.len();
 
 				// Annotation block checks, now that the row is known.
@@ -364,8 +400,11 @@ pub fn parse_document(text: &str) -> AsmDocument {
 					operands: decoded
 						.spans
 						.iter()
-						.map(|(label, slice)| {
-							(label.clone(), number, grammar::column_of(raw, slice))
+						.map(|(label, slice, value)| AsmOperand {
+							label: label.clone(),
+							text: (*value).to_owned(),
+							line: number,
+							column: grammar::column_of(raw, slice),
 						})
 						.collect(),
 				};
@@ -414,7 +453,7 @@ pub fn parse_document(text: &str) -> AsmDocument {
 					let column = decoded
 						.spans
 						.get(field_index)
-						.map(|(_, slice)| grammar::column_of(raw, slice))
+						.map(|(_, slice, _)| grammar::column_of(raw, slice))
 						.unwrap_or_else(|| grammar::column_of(raw, operands));
 					jumps.push(PendingJump { opcode_index, line: number, column, token });
 				}
@@ -445,20 +484,389 @@ pub fn parse_document(text: &str) -> AsmDocument {
 
 	resolve_jumps(&mut out, &jumps);
 	check_choice_counts(&mut out);
-	out.diagnostics.sort_by_key(|it| (it.line, it.column));
+	// The loader's table is the document's: every operand above already resolved through it.
+	out.constants = constants;
+	// A constants file's diagnostics stay together and follow the script's, which is the order
+	// `render_diagnostics` prints them in.
+	out.diagnostics.sort_by_key(|it| (it.source, it.line, it.column));
 	finish_manifest(&mut out.script);
 	out
+}
+
+// -- Constants files ------------------------------------------------------------------------------
+
+/// The deepest chain of constants files a document may have open at once.
+const INCLUDE_DEPTH: usize = 32;
+
+/// Resolves the `include` annotations of every file a document is made of, and reads each constants
+/// file's definitions into one table.
+///
+/// A file's includes are resolved before its own definitions are read, a path already read is not
+/// read again, and a name may be used before it is defined (a name is resolved when an operand is
+/// parsed, not when the file is read), so `include` is order-independent and a symbol is visible
+/// file-wide. Nothing here knows about an engine: a `.inc` file is data, which is what makes a port
+/// to another engine an `.inc` set rather than a code change.
+#[derive(Default)]
+struct Loader {
+	constants: ConstantTable,
+	sources: Vec<Source>,
+	includes: Vec<Include>,
+	loaded: BTreeSet<PathBuf>,
+	stack: Vec<PathBuf>,
+	errors: Vec<Diagnostic>,
+}
+
+impl Loader {
+	/// A loader whose first source is the script itself.
+	fn new(script: &Utf8Path) -> Self {
+		Loader {
+			sources: vec![Source { path: script.to_string(), kind: SourceKind::Script }],
+			..Loader::default()
+		}
+	}
+
+	/// Resolves every `include` annotation of the script. The script's own lines are parsed by
+	/// [`parse_document`], which is what reports a malformed one; this is what reads the files it
+	/// names, each recorded for [`super::print::print_document`] to re-emit.
+	fn load_script(&mut self, text: &str, path: &Utf8Path) {
+		self.stack.push(key_of(path));
+		for (line, target) in include_paths(text) {
+			self.includes.push(Include { source: 0, path: target.clone(), line });
+			self.include(path, 0, line, &target);
+		}
+		self.stack.pop();
+	}
+
+	/// Resolves one `include` annotation: the file it names becomes a source, and that file's own
+	/// includes are read before the caller's next line is considered.
+	fn include(&mut self, from: &Utf8Path, source: usize, line: usize, target: &str) {
+		if self.stack.len() > INCLUDE_DEPTH {
+			self.error(source, line, "include depth exceeds 32".to_owned());
+			return;
+		}
+		let path = resolve_path(from, target);
+		let key = key_of(&path);
+		if self.stack.contains(&key) {
+			let mut chain: Vec<String> =
+				self.stack.iter().map(|it| it.display().to_string()).collect();
+			chain.push(key.display().to_string());
+			self.error(source, line, format!("cyclic include: {}", chain.join(" -> ")));
+			return;
+		}
+		if self.loaded.contains(&key) {
+			return;
+		}
+		let Ok(text) = std::fs::read_to_string(&path) else {
+			self.error(source, line, format!("include file not found: \"{target}\""));
+			return;
+		};
+		self.loaded.insert(key.clone());
+		let index = self.sources.len();
+		self.sources.push(Source { path: path.to_string(), kind: SourceKind::Constants });
+		self.stack.push(key);
+		self.read_definitions(&text, index, &path);
+		self.stack.pop();
+	}
+
+	/// A constants file: its magic, then its includes, then its definitions. The shapes are the ones
+	/// the scripts are read with, so a constants file and a script agree about what a blank line, an
+	/// annotation, a record and an unrecognizable line are.
+	fn read_definitions(&mut self, text: &str, source: usize, path: &Utf8Path) {
+		let has_content = text.lines().any(|it| !it.trim().is_empty());
+		if has_content {
+			let first = text.lines().next().unwrap_or_default().trim_end();
+			if first != CONST_MAGIC {
+				self.error(
+					source,
+					1,
+					format!("line 1 must be exactly \"{CONST_MAGIC}\", found \"{first}\""),
+				);
+			}
+		}
+		for (line, target) in include_paths(text) {
+			self.includes.push(Include { source, path: target.clone(), line });
+			self.include(path, source, line, &target);
+		}
+		for (index, raw) in text.lines().enumerate() {
+			let number = index + 1;
+			if has_content && index == 0 {
+				continue;
+			}
+			// A `;` comment is ignored: nothing re-emits a constants file, so it needs no anchor.
+			let (code, _) = grammar::code_and_comment(raw);
+			let trimmed = code.trim_end();
+			match grammar::classify(trimmed) {
+				LineShape::Blank => {}
+				LineShape::Annotation => {
+					// The classifier has seen the `#`, so this cannot fail.
+					let Ok((_, (key, value))) = grammar::annotation(trimmed) else {
+						continue;
+					};
+					if key != "include" {
+						self.error(
+							source,
+							number,
+							"annotations are not allowed in a constants file".to_owned(),
+						);
+						continue;
+					}
+					// The file was resolved above; only a path that is no literal is left to report.
+					if grammar::string_value(value).is_err() {
+						self.error(
+							source,
+							number,
+							"malformed \"#include\" directive: expected a quoted path".to_owned(),
+						);
+					}
+				}
+				LineShape::Directive => self.error(
+					source,
+					number,
+					"directives are not allowed in a constants file".to_owned(),
+				),
+				LineShape::Instruction => self.define(trimmed, source, number),
+				LineShape::Record => self.error(
+					source,
+					number,
+					format!("malformed constant definition: \"{trimmed}\""),
+				),
+				LineShape::Bad => self.error(
+					source,
+					number,
+					format!("unrecognized line: \"{trimmed}\""),
+				),
+			}
+		}
+	}
+
+	/// One `NAME = <literal>` definition. A name that means something else is the only definition a
+	/// later one may not replace; a name that already means the same thing is accepted silently, so
+	/// two files may share a constant (and two paths to one file may defeat the dedup).
+	fn define(&mut self, text: &str, source: usize, line: usize) {
+		let malformed = || format!("malformed constant definition: \"{text}\"");
+		let Some((name, value)) = text.split_once('=') else {
+			self.error(source, line, malformed());
+			return;
+		};
+		let (name, value) = (name.trim(), value.trim());
+		// A definition is `NAME = <literal>`: a second `=` means nothing, and neither does anything
+		// after the literal.
+		if value.contains('=') {
+			self.error(source, line, malformed());
+			return;
+		}
+		// `L_<hex>` is the format's address label, so it can never be a constant's name; the rest of
+		// the rule is the one identifier every value token is read with.
+		if !grammar::is_identifier(name)
+			|| matches!(grammar::jump_target(name), Some(JumpTarget::LabelAddress(_)))
+		{
+			self.error(source, line, format!("invalid constant name \"{name}\""));
+			return;
+		}
+		let declared = match self.literal(text, name, value) {
+			Ok(it) => it,
+			Err(message) => {
+				self.error(source, line, message);
+				return;
+			}
+		};
+		if let Some(first) = self.constants.get(name) {
+			if self.same_value(first, &declared) {
+				return;
+			}
+			let path = self
+				.sources
+				.get(first.source)
+				.map(|it| it.path.as_str())
+				.unwrap_or_default();
+			let message = format!(
+				"constant \"{name}\" is already defined as {} ({path}:{})",
+				render_value(&first.value),
+				first.line
+			);
+			self.error(source, line, message);
+			return;
+		}
+		self.constants.insert(Constant { name: name.to_owned(), value: declared, source, line });
+	}
+
+	/// A definition's value: a `0x…` number with the width its digit count declares, an `@0x…`
+	/// address, a `"…"` string, or another constant's name. The two messages are the difference
+	/// between a broken line and a value that is no literal: anything after a literal makes the line
+	/// malformed, while a token that is no literal at all says what was found.
+	fn literal(&self, text: &str, name: &str, value: &str) -> Result<ConstantValue, String> {
+		let malformed = || format!("malformed constant definition: \"{text}\"");
+		let needs = || {
+			format!(
+				"constant \"{name}\" needs a hex literal, an address, a string or another constant, found \"{value}\""
+			)
+		};
+		if let Some((address, digits)) = split_literal(value) {
+			let run: &str = {
+				let rest = digits.trim_start_matches(|c: char| c.is_ascii_hexdigit());
+				&digits[..digits.len() - rest.len()]
+			};
+			if run.is_empty() {
+				return Err(needs());
+			}
+			if run.len() != digits.len() {
+				return Err(malformed());
+			}
+			if run.len() > 8 {
+				let digits = run.trim_start_matches('0');
+				let digits = if digits.is_empty() { "0" } else { digits };
+				return Err(format!(
+					"constant \"{name}\" value {}{} is wider than 4 bytes",
+					if address { "@0x" } else { "0x" },
+					digits.to_ascii_uppercase()
+				));
+			}
+			let value = u64::from_str_radix(run, 16).unwrap_or_default();
+			return Ok(if address {
+				ConstantValue::Address(value as usize)
+			} else {
+				ConstantValue::Number { value, width: (run.len() as u8).div_ceil(2) }
+			});
+		}
+		if grammar::is_identifier(value) {
+			return Ok(ConstantValue::Alias(value.to_owned()));
+		}
+		// A leading identifier followed by anything else is a definition with junk after its name.
+		if value.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+			return Err(malformed());
+		}
+		if value.starts_with('"') {
+			if let Ok((_, text)) = grammar::string_value(value) {
+				return Ok(ConstantValue::Text(text));
+			}
+			// A literal that closed and then kept going broke the line; one that never closed is no
+			// literal at all.
+			return Err(if value[1..].contains('"') { malformed() } else { needs() });
+		}
+		Err(needs())
+	}
+
+	/// Whether a redefinition declares what the name already means, compared after alias resolution:
+	/// a shared constant may be written as a literal in one file and as another name in the next.
+	fn same_value(&self, first: &Constant, value: &ConstantValue) -> bool {
+		let declared = match value {
+			ConstantValue::Alias(target) => self.constants.resolve(target).ok(),
+			other => other.resolved(),
+		};
+		match (declared, self.constants.resolve(&first.name)) {
+			(Some(declared), Ok(existing)) => declared == existing,
+			_ => false,
+		}
+	}
+
+	fn error(&mut self, source: usize, line: usize, message: String) {
+		self.errors.push(Diagnostic::new(source, Severity::Error, line, 1, message));
+	}
+}
+
+/// Loads a constants file and everything it includes, with no script beside it — how
+/// `ccfkb_disassemble` enters the loader. The root file was named on the command line, so it must
+/// exist; a file it includes reports a diagnostic instead, which is what makes every problem a
+/// positioned message rather than an error out of the middle of a walk.
+pub(crate) fn load_constants(
+	path: &Utf8Path,
+) -> anyhow::Result<(ConstantTable, Vec<Source>, Vec<Diagnostic>)> {
+	let input =
+		std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+	let mut loader = Loader {
+		sources: vec![Source { path: path.to_string(), kind: SourceKind::Constants }],
+		..Loader::default()
+	};
+	loader.stack.push(key_of(path));
+	loader.read_definitions(&input, 0, path);
+	Ok((loader.constants, loader.sources, loader.errors))
+}
+
+/// The `include` annotations of a file, in the order they are written: the line each sits on and the
+/// path it names. A path that is no quoted literal is skipped — only the caller knows which file's
+/// line the report belongs to, so reporting it is the caller's.
+fn include_paths(text: &str) -> Vec<(usize, String)> {
+	let mut out = Vec::new();
+	for (index, raw) in text.lines().enumerate() {
+		let (code, _) = grammar::code_and_comment(raw);
+		let trimmed = code.trim_end();
+		if !matches!(grammar::classify(trimmed), LineShape::Annotation) {
+			continue;
+		}
+		// The classifier has seen the `#`, so this cannot fail.
+		let Ok((_, (key, value))) = grammar::annotation(trimmed) else {
+			continue;
+		};
+		if key != "include" {
+			continue;
+		}
+		if let Ok(target) = grammar::value_of(grammar::string_value(value)) {
+			out.push((index + 1, target));
+		}
+	}
+	out
+}
+
+/// The path an `include` annotation names: an absolute path is used as it is, a relative one resolves
+/// against the directory of the file that wrote it (no search path, no environment variable).
+fn resolve_path(from: &Utf8Path, target: &str) -> Utf8PathBuf {
+	let target = Utf8PathBuf::from(target);
+	match (target.is_absolute(), from.parent()) {
+		(true, _) | (false, None) => target,
+		(false, Some(dir)) => dir.join(target),
+	}
+}
+
+/// The key two paths are compared by: the canonical path when the file exists, the path as written
+/// when it does not, so a missing file is reported rather than merged with a later one.
+fn key_of(path: &Utf8Path) -> PathBuf {
+	std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path.as_str()))
+}
+
+/// Splits a number or address literal's prefix from its digits: `(is_address, digits)`.
+fn split_literal(value: &str) -> Option<(bool, &str)> {
+	if let Some(rest) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+		return Some((false, rest));
+	}
+	if let Some(rest) = value.strip_prefix("@0x").or_else(|| value.strip_prefix("@0X")) {
+		return Some((true, rest));
+	}
+	None
+}
+
+/// Renders a definition the way the format writes one: `0x` + uppercase hex without padding, `@0x` +
+/// eight digits, a quoted string, or an alias's name.
+fn render_value(value: &ConstantValue) -> String {
+	match value {
+		ConstantValue::Number { value, .. } => format!("0x{value:X}"),
+		ConstantValue::Address(value) => format!("@0x{value:08X}"),
+		ConstantValue::Text(text) => format!("\"{}\"", escape_string(text)),
+		ConstantValue::Alias(name) => name.clone(),
+	}
 }
 
 /// A parser failure as the positioned error a line reports: the column is the character column of the
 /// token the parser stopped at.
 fn positioned(line: &str, number: usize, failure: AsmError<'_>) -> Diagnostic {
-	Diagnostic {
-		severity: Severity::Error,
-		line: number,
-		column: grammar::column_of(line, failure.input),
-		message: failure.message,
-	}
+	Diagnostic::new(
+		0,
+		Severity::Error,
+		number,
+		grammar::column_of(line, failure.input),
+		failure.message,
+	)
+}
+
+/// A finding a value parser produced while still succeeding, positioned at the token it belongs to
+/// (the token is a slice of the line, exactly like an error's).
+fn finding_at(line: &str, number: usize, finding: DecodedFlag<'_>) -> Diagnostic {
+	Diagnostic::new(
+		0,
+		Severity::Flag,
+		number,
+		grammar::column_of(line, finding.input),
+		finding.message,
+	)
 }
 
 fn unrecognized(line: usize, text: &str) -> Diagnostic {
@@ -478,12 +886,17 @@ fn trailing_hash(line: usize) -> Diagnostic {
 /// own parser reports the first problem it meets, so the parts are read left to right and a value
 /// the format rejects keeps its own message; everything else (a part with no `:`, a label the record
 /// does not define, a missing label) is an unrecognized line.
-fn choice_record(text: &str, segments: &[&str]) -> Result<Choice, String> {
+fn choice_record<'a>(
+	text: &'a str,
+	segments: &[&'a str],
+	constants: &ConstantTable,
+	findings: &mut Vec<DecodedFlag<'a>>,
+) -> Result<Choice, String> {
 	let unrecognized = || format!("unrecognized line: \"{text}\"");
 	let mut arg1 = None;
 	let mut choice_str = None;
 	let mut trailer = None;
-	for segment in segments {
+	for segment in segments.iter().copied() {
 		let Ok((_, (label, value))) = grammar::label_value(segment) else {
 			return Err(unrecognized());
 		};
@@ -491,12 +904,19 @@ fn choice_record(text: &str, segments: &[&str]) -> Result<Choice, String> {
 			"arg1" => {
 				arg1 = Some(
 					grammar::value_of(
-						grammar::hex_value("arg1", 4, "a 2-byte hex literal").parse(value),
+						grammar::hex_value("arg1", 4, "a 2-byte hex literal", constants, findings)
+							.parse(value),
 					)? as u16,
 				);
 			}
-			"text" => choice_str = Some(grammar::value_of(grammar::string_value(value))?),
-			"trailer" => trailer = Some(grammar::value_of(grammar::byte_list_value(value))?),
+			"text" => {
+				choice_str = Some(grammar::value_of(
+					grammar::string_operand("text", constants).parse(value),
+				)?)
+			}
+			"trailer" => {
+				trailer = Some(grammar::value_of(grammar::byte_list_value(value, constants))?)
+			}
 			_ => return Err(unrecognized()),
 		}
 	}
@@ -516,6 +936,8 @@ fn choice_record(text: &str, segments: &[&str]) -> Result<Choice, String> {
 fn parse_annotation(
 	out: &mut AsmDocument,
 	pending: &mut PendingAnnotations,
+	constants: &ConstantTable,
+	trailer_line: &mut Option<usize>,
 	line: usize,
 	column: usize,
 	key: &str,
@@ -561,6 +983,34 @@ fn parse_annotation(
 				.push((line, column, if text.is_empty() { None } else { Some(text) })),
 			Err(message) => out.diagnostics.push(error(line, column, message)),
 		},
+		// The file the annotation names was already resolved by the loader, before this line was
+		// reached: what is left for a line-at-a-time reader is the one thing the loader skips, a path
+		// that is not a literal. A well-formed include reports nothing at all.
+		"include" => {
+			if grammar::string_value(value).is_err() {
+				out.diagnostics.push(error(
+					line,
+					column,
+					"malformed \"#include\" directive: expected a quoted path".to_owned(),
+				));
+			}
+		}
+		// File-scope like `include`: the trailer is not part of the block an instruction consumes.
+		"trailer" => {
+			if let Some(first) = *trailer_line {
+				out.diagnostics.push(error(
+					line,
+					1,
+					format!("duplicate \"#trailer\" annotation (first on line {first})"),
+				));
+				return;
+			}
+			*trailer_line = Some(line);
+			match grammar::value_of(grammar::byte_list_value(value, constants)) {
+				Ok(bytes) => out.script.trailer = bytes,
+				Err(message) => out.diagnostics.push(error(line, column, message)),
+			}
+		}
 		_ => out
 			.diagnostics
 			.push(flag(line, column, format!("unknown annotation key \"{key}\""))),
@@ -615,12 +1065,13 @@ fn resolve_jumps(out: &mut AsmDocument, jumps: &[PendingJump]) {
 					),
 				)
 			};
-			out.diagnostics.push(Diagnostic {
+			out.diagnostics.push(Diagnostic::new(
+				0,
 				severity,
-				line: pending.line,
-				column: pending.column,
+				pending.line,
+				pending.column,
 				message,
-			});
+			));
 		}
 		let field_index = if is_jump_field(opcode, 0) { 0 } else { 3 };
 		if let Some(field) = out.script.opcodes[pending.opcode_index].fields.get_mut(field_index) {
@@ -666,16 +1117,23 @@ fn check_choice_counts(out: &mut AsmDocument) {
 }
 
 fn error(line: usize, column: usize, message: String) -> Diagnostic {
-	Diagnostic { severity: Severity::Error, line, column, message }
+	Diagnostic::new(0, Severity::Error, line, column, message)
 }
 
 fn flag(line: usize, column: usize, message: String) -> Diagnostic {
-	Diagnostic { severity: Severity::Flag, line, column, message }
+	Diagnostic::new(0, Severity::Flag, line, column, message)
 }
 
 #[cfg(test)]
 mod test {
 	use super::*;
+	use camino::Utf8Path;
+
+	/// Every test parses as if the file were `T.WSC` beside the working directory: no include it
+	/// names exists, which is exactly what a fixture without one needs.
+	fn parse(text: &str) -> AsmDocument {
+		parse_document(text, Utf8Path::new("T.WSC"))
+	}
 
 	#[test]
 	fn parse_line_is_line_atomic() {
@@ -701,7 +1159,7 @@ mod test {
 
 		// The document loop is this parser and nothing else: the diagnostics a document reports for
 		// a line are exactly the line's own, comment included.
-		let doc = parse_document("# cc-fkb asm 1\n\n   nope\nnop_yield pad: 0x00 ; why\n");
+		let doc = parse("# cc-fkb asm 1\n\n   nope\nnop_yield pad: 0x00 ; why\n");
 		assert_eq!(doc.diagnostics, parse_line("   nope", 3).diagnostics);
 		assert_eq!(doc.diagnostics[0].message, "unrecognized line: \"   nope\"");
 		assert_eq!(parse_line("nop_yield pad: 0x00 ; why", 4).comment, Some(("why", 21)));
@@ -715,7 +1173,7 @@ mod test {
 		// operand, not its byte offset.
 		let bad = "textbox_with_speaker layout_id: 0x0114, mode: 0x01, speaker_arg: 0x02, \
 timer_param: 0x00, speaker_text: \"あい\", wrng: \"うえ\"";
-		let doc = parse_document(&format!("# cc-fkb asm 1\n{bad}\n"));
+		let doc = parse(&format!("# cc-fkb asm 1\n{bad}\n"));
 		assert_eq!(doc.diagnostics.len(), 1, "{:#?}", doc.diagnostics);
 		let reported = &doc.diagnostics[0];
 		assert_eq!(reported.line, 2);
@@ -727,19 +1185,20 @@ timer_param: 0x00, speaker_text: \"あい\", wrng: \"うえ\"";
 		// The operand spans are character columns too.
 		let line = "textbox_with_speaker layout_id: 0x0114, mode: 0x01, speaker_arg: 0x02, \
 timer_param: 0x00, speaker_text: \"あい\", text: \"うえ\"";
-		let doc = parse_document(&format!("# cc-fkb asm 1\n{line}\n"));
+		let doc = parse(&format!("# cc-fkb asm 1\n{line}\n"));
 		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
 		let operands = &doc.items[0].operands;
 		assert_eq!(operands.len(), 6, "{operands:?}");
-		let (label, number, column) = &operands[5];
-		assert_eq!(label, "text");
-		assert_eq!(*number, 2);
+		let operand = &operands[5];
+		assert_eq!(operand.label, "text");
+		assert_eq!(operand.line, 2);
+		assert_eq!(operand.text, "\"うえ\"", "the value token as written is kept");
 		let byte_offset = line.find("text: \"うえ\"").expect("the last string operand");
-		assert_ne!(*column, byte_offset + 1, "a byte offset is not a column");
-		assert_eq!(*column, line[..byte_offset].chars().count() + 1);
+		assert_ne!(operand.column, byte_offset + 1, "a byte offset is not a column");
+		assert_eq!(operand.column, line[..byte_offset].chars().count() + 1);
 
 		// A line is parsed on its own, so a bad line after it reports its own number.
-		let doc = parse_document(&format!("# cc-fkb asm 1\n{line}\nnope\n"));
+		let doc = parse(&format!("# cc-fkb asm 1\n{line}\nnope\n"));
 		assert_eq!(doc.diagnostics.len(), 1, "{:#?}", doc.diagnostics);
 		assert_eq!(doc.diagnostics[0].line, 3);
 		assert_eq!(doc.diagnostics[0].message, "unknown mnemonic \"nope\"");
@@ -765,7 +1224,7 @@ nop pad: [ 0x00,\n\
 # translation \"\\q\"\n\
   trailer: [ 0x00 ]\n\
 nop_yield pad: [ 0x00, 0x00 ]\n";
-		let doc = parse_document(fixture);
+		let doc = parse(fixture);
 		assert!(doc.has_errors(), "garbage is reported:\n{:#?}", doc.diagnostics);
 		// Every one of those lines is noted and the file is still read to the end.
 		assert_eq!(doc.items.last().map(|it| it.opcode), Some(0xE6));

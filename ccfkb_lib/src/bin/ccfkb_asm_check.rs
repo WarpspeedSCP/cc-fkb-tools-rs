@@ -11,12 +11,13 @@ fn main() -> anyhow::Result<()> {
 		print!("{}", render_diagnostics(&file, &doc));
 		let summary = doc.summary();
 		println!(
-			"{file}: {} instructions ({} annotated, {} inserted, {} errors, {} findings), {} bytes",
+			"{file}: {} instructions ({} annotated, {} inserted, {} errors, {} findings), {} constants, {} bytes",
 			summary.instructions,
 			summary.annotated,
 			summary.inserted,
 			summary.errors,
 			summary.findings,
+			summary.constants,
 			doc.byte_len()
 		);
 		if summary.errors > 0 {
