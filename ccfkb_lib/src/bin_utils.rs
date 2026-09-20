@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context};
 use crate::data::text_script::{parse_doclines, tl_reverse_transform_script, tl_transform_script};
+use crate::asm::{parse_document, print_script, AsmDocument};
 use crate::data::{decode_wsc, fix_yaml_str};
 use crate::opcodes::{validate_opcode_table, Script};
 use camino::Utf8Path;
@@ -80,4 +81,39 @@ pub fn encode_wsc_file_command(yaml_name_path: &Utf8Path, out_dir_path: &Utf8Pat
 		.with_context(|| format!("writing {out_dir_path}/{out_name}"))?;
 
 	Ok(())
+}
+
+/// Reads a decoded `.WSC` and returns its assembly text.
+pub fn disassemble_wsc_file_command(
+	wsc_name_path: &Utf8Path,
+	script_name: &str,
+) -> anyhow::Result<String> {
+	log::info!("Disassembling file {}", wsc_name_path.file_name().unwrap_or_default());
+	let input = std::fs::read(wsc_name_path)
+		.with_context(|| format!("reading {wsc_name_path}"))?;
+
+	let script = decode_wsc(&input);
+
+	print_script(&script, script_name)
+		.with_context(|| format!("printing {wsc_name_path} as assembly"))
+}
+
+/// Reads and parses an `.asm` file. Parsing never fails: problems come back as diagnostics.
+pub fn load_asm_file_command(asm_name_path: &Utf8Path) -> anyhow::Result<AsmDocument> {
+	log::info!("Reading file {}", asm_name_path.file_name().unwrap_or_default());
+	let input = std::fs::read_to_string(asm_name_path)
+		.with_context(|| format!("reading {asm_name_path}"))?;
+
+	Ok(parse_document(&input))
+}
+
+/// Renders a document's diagnostics, one per line, as
+/// `{path}:{line}:{column}: {error|warning}: {message}` in ascending `(line, column)` order — the
+/// order `parse_document` produced. Empty when the file has none.
+pub fn render_diagnostics(path: &Utf8Path, doc: &AsmDocument) -> String {
+	if doc.diagnostics.is_empty() {
+		return String::new();
+	}
+	let lines: Vec<String> = doc.diagnostics.iter().map(|it| it.render(path.as_str())).collect();
+	format!("{}\n", lines.join("\n"))
 }

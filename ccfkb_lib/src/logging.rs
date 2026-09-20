@@ -15,6 +15,7 @@ enum LogOutput {
 struct SimpleLogger {
 	level: Level,
 	log_filenames: bool,
+	no_logging: bool,
 	output_buffers: [LogOutput; 6],
 }
 
@@ -24,6 +25,9 @@ impl log::Log for SimpleLogger {
 	}
 
 	fn log(&self, record: &Record) {
+		if self.no_logging {
+			return;
+		}
 		if self.enabled(record.metadata()) {
 			let output = &self.output_buffers[record.level() as usize];
 			let file_str = if self.log_filenames {
@@ -73,9 +77,17 @@ impl log::Log for SimpleLogger {
 
 impl SimpleLogger {
 	pub fn from_env() -> anyhow::Result<Box<Self>> {
+		let mut no_logging = false;
 		let matching_level = match env::var("RUST_LOG") {
-			Ok(value) => log::Level::from_str(&value)
-				.map_err(|_err| anyhow!("RUST_LOG has unknown log level {value:?}"))?,
+			Ok(value) => {
+				if value.to_lowercase() == "off" {
+					no_logging = true;
+					Level::Error
+				} else {
+					log::Level::from_str(&value)
+						.map_err(|_err| anyhow!("RUST_LOG has unknown log level {value:?}"))?
+				}
+			},
 			Err(_) => Level::Info,
 		};
 
@@ -131,6 +143,7 @@ impl SimpleLogger {
 		Ok(Box::new(SimpleLogger {
 			level: matching_level,
 			log_filenames: false,
+			no_logging,
 			output_buffers
 		}))
 	}

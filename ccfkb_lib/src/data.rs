@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 use std::collections::BTreeMap;
-use crate::opcodes::{lookup_spec, make_opcode, Script};
+use crate::opcodes::{make_opcode, manifest_for, Script};
 use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress, lz77_compress};
 use camino::{Utf8Path as Utf8Path, Utf8PathBuf};
 use serde_derive::{Deserialize, Serialize};
@@ -857,14 +857,7 @@ pub fn decode_wsc(input: &[u8]) -> Script {
 	};
 
 	// Global opcode manifest: one entry per opcode this file uses, ascending.
-	let mut used = std::collections::BTreeSet::new();
-	for op in &opcodes {
-		used.insert(op.opcode);
-	}
-	let opcode_table = used
-		.into_iter()
-		.filter_map(|byte| lookup_spec(byte).map(|spec| spec.to_manifest()))
-		.collect();
+	let opcode_table = manifest_for(&opcodes);
 
 	let out = Script {
 		opcode_table,

@@ -3,7 +3,7 @@ use crate::util::{encode_sjis, get_sjis_bytes, transmute_to_u16};
 use itertools::Itertools;
 use serde::Serializer;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct TLString {
@@ -27,7 +27,7 @@ impl TLString {
 	}
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum OpField {
 	Byte(
 		#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
@@ -45,14 +45,14 @@ pub enum OpField {
 }
 
 impl OpField {
-	fn as_dword(&self) -> Option<u32> {
+	pub(crate) fn as_dword(&self) -> Option<u32> {
 		match &self {
 			OpField::DWord(d) => Some(*d),
 			_ => None,
 		}
 	}
 
-	fn size(&self) -> usize {
+	pub(crate) fn size(&self) -> usize {
 		match self {
 			OpField::Byte(_) => 1,
 			OpField::Word(_) => 2,
@@ -89,7 +89,7 @@ impl OpField {
 	}
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Choice {
 	#[serde(serialize_with = "crate::opcodes::serialize_hex_u16")]
 	pub arg1: u16,
@@ -99,7 +99,7 @@ pub struct Choice {
 }
 
 impl Choice {
-	fn size(&self) -> usize {
+	pub(crate) fn size(&self) -> usize {
 		let str_len = if let Some(tl) = &self.choice_str.translation {
 			encode_sjis(tl).len() + 1
 		} else {
@@ -137,6 +137,10 @@ pub struct OpcodeSpecStatic {
 	pub name: &'static str,
 	pub layout: &'static [Code],
 	pub operands: &'static [&'static str],
+	/// True when the engine can hand control back to the frame driver after this instruction
+	/// (derivation and per-opcode evidence: `validation/opcodes/control-flow.md`). It does not mean
+	/// "blocks": 32 opcodes can return, several of them only on one branch. Pinned by `spec_test`.
+	pub yields: bool,
 }
 
 /// Renders a layout with the same spelling the docs use: `b w b w p 1`.
@@ -162,6 +166,7 @@ pub struct OpcodeSpec {
 	#[serde(serialize_with = "serialize_hex_u8")]
 	pub opcode: u8,
 	pub name: String,
+	pub yields: bool,
 	pub layout: String,
 	#[serde(serialize_with = "serialize_flow_strings")]
 	pub operands: Vec<String>,
@@ -172,6 +177,7 @@ impl OpcodeSpecStatic {
 		OpcodeSpec {
 			opcode: self.opcode,
 			name: self.name.to_owned(),
+			yields: self.yields,
 			layout: render_layout(self.layout),
 			operands: self.operands.iter().map(|it| (*it).to_owned()).collect(),
 		}
@@ -181,7 +187,7 @@ impl OpcodeSpecStatic {
 /// One decoded instruction. The mnemonic is deliberately absent: it is defined once in
 /// [`OPCODE_SPECS`] and, per file, in the `opcode_table:` manifest, so `opcode` is the only key an
 /// instruction needs.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Opcode {
 	#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
 	pub opcode: u8,
@@ -192,7 +198,7 @@ pub struct Opcode {
 	pub fields: Vec<OpField>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Script {
 	/// Global opcode manifest: mnemonic, layout and operand names for every opcode this file uses.
 	/// Emitted once per file (sorted by opcode byte) so instruction records stay positional.
@@ -424,6 +430,19 @@ where
 	serializer.serialize_str(&format!("[ {} ]", data.join(", ")))
 }
 
+/// Global opcode manifest for a decoded instruction list: one entry per distinct opcode byte it
+/// uses, ascending. This is the `opcode_table:` block of a decoded file, and the reason a script
+/// carries its own mnemonic/operand/control-flow documentation.
+pub fn manifest_for(opcodes: &[Opcode]) -> Vec<OpcodeSpec> {
+	let mut used = BTreeMap::new();
+	for op in opcodes {
+		used.insert(op.opcode, ());
+	}
+	used.keys()
+		.filter_map(|byte| lookup_spec(*byte).map(|spec| spec.to_manifest()))
+		.collect()
+}
+
 /// Looks up the compiled-in spec for an opcode byte.
 pub fn lookup_spec(opcode: u8) -> Option<&'static OpcodeSpecStatic> {
 	OPCODE_SPECS.iter().find(|it| it.opcode == opcode)
@@ -559,11 +578,14 @@ macro_rules! decode_components {
 /// used by [`make_opcode`], so the table, the decoder and the YAML manifest cannot drift apart.
 ///
 /// Row grammar: `0xNN => mnemonic [ operand_name: code, … ]`, one entry per emitted field
-/// (padding included, spelled `pad: p <bytes>`). Derivation of names:
+/// (padding included, spelled `pad: p <bytes>`), with an optional trailing `yields` marker before
+/// the comma for the rows whose body can return to the frame driver. Derivation of names:
 /// `validation/opcodes/reference.md` + `layouts.md` + `heap-access.md`; agreement pinned by the
 /// test module below.
 macro_rules! opcode_table {
-	( $( $op:literal => $mnemonic:ident [ $( $name:ident : $code:ident $( $num:literal )? ),* $(,)? ] ),* $(,)? ) => {
+	(@y yields) => { true };
+	(@y) => { false };
+	( $( $op:literal => $mnemonic:ident [ $( $name:ident : $code:ident $( $num:literal )? ),* $(,)? ] $( $marker:ident )? ),* $(,)? ) => {
 		/// Every implemented opcode, ascending by opcode byte.
 		pub static OPCODE_SPECS: &[OpcodeSpecStatic] = &[
 			$(
@@ -572,6 +594,7 @@ macro_rules! opcode_table {
 					name: stringify!($mnemonic),
 					layout: &[ $( layout_code!($code $( $num )?) ),* ],
 					operands: &[ $( stringify!($name) ),* ],
+					yields: opcode_table!(@y $( $marker )?),
 				}
 			),*
 		];
@@ -602,91 +625,91 @@ macro_rules! opcode_table {
 
 opcode_table! {
 	0x01 => conditional_branch [ branch_type: b, arg1: w, arg2: w, offset: d, pad: p 1,],
-	0x02 => choice_jump [ count: b, separator: p 1, choices: c,],  // ❌ choice-list trailer byte the engine reads is padding in the Rust arm
+	0x02 => choice_jump [ count: b, separator: p 1, choices: c,] yields,  // ❌ choice-list trailer byte the engine reads is padding in the Rust arm
 	0x03 => variable_heap_op [ kind: b, var_index: w, indirect: b, value: w, pad: p 1,],
-	0x04 => wait_rerun [ ],
-	0x05 => movie_overlay_flag [ arg1: b, pad: p 1,],
+	0x04 => wait_rerun [ ] yields,
+	0x05 => movie_overlay_flag [ arg1: b, pad: p 1,] yields,
 	0x06 => absolute_jump [ target: d, pad: p 1,],
 	0x07 => resource_string [ filename: s,],
-	0x08 => nop [ pad: p 1,],
+	0x08 => nop_yield [ pad: p 1,] yields,
 	0x09 => call_script [ filename: s,],
 	0x0A => return [ pad: p 1,],
-	0x0B => start_timer [ seconds: b, pad: p 1,],
+	0x0B => start_countdown [ duration_ds: b, pad: p 1,],
 	0x0C => read_timer [ var_index: w, pad: p 1,],
 	0x0D => fill_variable_range [ var_index: w, count: w, value: w, pad: p 1,],
 	0x0E => stop_movie_flag [ arg1: b, pad: p 1,],
 	0x21 => play_ogg_voice_pair [ arg1: b, arg2: w, pan: b, arg4: w, arg5: d, filename: s,],
 	0x22 => voice_pair_stop_volume [ arg1: b, volume: w, pad: p 1,],
-	0x23 => sprite_linked_voice [ flags: b, slot: w, frame: w, arg4: w, mode: b, arg6: b, filename: s,],
+	0x23 => sprite_linked_voice_ch0 [ flags: b, slot: w, frame: w, arg4: w, mode: b, arg6: b, filename: s,],
 	0x24 => audio_mixer_reset [ pad: p 1,],
-	0x25 => sfx_play [ slot: b, repeat: b, persist: w, pad: p 2, position: b, arg6: w, volume: b, flags: b, filename: s,],  // ❌ engine: w@+3..4 merged, live u16 @+5..6 hidden in p 2
+	0x25 => sfx_play [ slot: b, repeat: b, persist: w, pad: p 2, position: b, arg6: w, volume: b, flags: b, filename: s,] yields,  // ❌ engine: w@+3..4 merged, live u16 @+5..6 hidden in p 2
 	0x26 => sfx_stop [ slot: b, pad: p 1,],
-	0x27 => sprite_linked_voice [ flags: b, slot: w, frame: w, arg4: w, mode: b, arg6: b, filename: s,],
+	0x27 => sprite_linked_voice_ch1 [ flags: b, slot: w, frame: w, arg4: w, mode: b, arg6: b, filename: s,],
 	0x28 => sfx_seek [ slot: b, position: b, arg3: w, pad: p 1,],
 	0x29 => sfx_stop_fade [ slot: b, arg2: w, pad: p 1,],
 	0x30 => voice_pair_pan [ pan: b, arg2: w, pad: p 1,],
-	0x31 => sfx_slot_rearm_persist [ slot: b, pad: p 1,],
-	0x32 => sfx_slot_rearm [ slot: b, pad: p 1,],
+	0x31 => sfx_slot_rearm_persist [ slot: b, pad: p 1,] yields,
+	0x32 => sfx_slot_rearm [ slot: b, pad: p 1,] yields,
 	0x33 => read_voice_position [ minutes: w, seconds: w, milliseconds: w, pad: p 1,],
-	0x41 => textbox_no_speaker [ layout_id: w, mode: b, timer_param: b, text: s,],
-	0x42 => textbox_with_speaker [ layout_id: w, mode: b, speaker_arg: b, timer_param: b, speaker_text: s, text: s,],
+	0x41 => textbox_no_speaker [ layout_id: w, mode: b, timer_param: b, text: s,] yields,
+	0x42 => textbox_with_speaker [ layout_id: w, mode: b, speaker_arg: b, timer_param: b, speaker_text: s, text: s,] yields,
 	0x43 => load_anm_animation [ slot: b, x: w, y: w, flags: b, filename: s,],
-	0x44 => enable_sprite_frame [ slot: b, frame: b, active: b, pad: p 1,],
-	0x45 => flip_sprite_frame [ slot: b, frame: b, arg3: b, pad: p 1,],
+	0x44 => enable_sprite_frame [ slot: b, frame: b, active: b, pad: p 1,] yields,
+	0x45 => flip_sprite_frame [ slot: b, frame: b, arg3: b, pad: p 1,] yields,
 	0x46 => load_background [ x: w, y: w, format_param: d, flags: b, filename: s,],
 	0x47 => background_show_hide [ mode: b, pad: p 1,],
 	0x48 => load_static_sprite [ slot: b, x: w, y: w, id: d, flags: b, use_default: b, filename: s,],
 	0x49 => static_sprite_active_flag [ slot: w, pad: p 1,],  // ⚠ w@+1..2 spans two engine operands (lossless)
-	0x4A => scene_wipe_transition [ mode: b, param_a: w, param_b: w, pad: p 1,],
+	0x4A => scene_wipe_transition [ mode: b, param_a: w, param_b: w, pad: p 1,] yields,
 	0x4B => transition_entry [ layer_id: b, arg2: w, arg3: w, handle: d, flag_5c: w, field_84: d, field_88: d, pad: p 1,],
-	0x4C => scene_transition_1 [ flag_a: b, param_a: b, arg3: b, param_c: d, pad: p 1,],
+	0x4C => scene_transition_1 [ flag_a: b, param_a: b, arg3: b, param_c: d, pad: p 1,] yields,
 	0x4D => transition_effect_params [ mode: b, gate_arg: b, count: w, param_a: w, param_b: w, param_c: w, param_d: w, pad: p 1,],
 	0x4E => wipe_particle_effect [ kind: b, direction: b, regen: b, pad: p 1,],
-	0x4F => clear_sprite_frame_markers [ slot: b, frame: b, arg3: b, pad: p 1,],
+	0x4F => clear_sprite_frame_markers [ slot: b, frame: b, arg3: b, pad: p 1,] yields,
 	0x50 => load_tbl [ filename: s,],
-	0x51 => read_words_to_variables [ mouse_x: w, mouse_y: w, pad: p 1,],
+	0x51 => read_words_to_variables [ mouse_x: w, mouse_y: w, pad: p 1,] yields,
 	0x52 => unload_tbl [ unused: b, pad: p 1,],  // ⚠ operand is never read by the engine
 	0x53 => load_wip_and_mask [ flags: b, arg1: w, arg2: w, filename: s,],
 	0x54 => load_msk [ filename: s,],
 	0x55 => free_msk [ pad: p 1,],
 	0x56 => message_subsystem_state [ pad: p 1,],
 	0x57 => movement_block_setup [ arg1: w, arg2: w, arg3: d, pad: p 1,],
-	0x58 => per_slot_value_pair [ slot: b, arg2: b, arg3: b, arg4: w, arg5: w, pad: p 1,],
+	0x58 => per_slot_value_pair [ slot: b, arg2: b, arg3: b, arg4: w, arg5: w, pad: p 1,] yields,
 	0x59 => preload_wip [ filename: s,],
 	0x60 => release_wipe_resources [ pad: p 1,],
-	0x61 => load_start_movie [ mode: b, filename: s,],
+	0x61 => load_start_movie [ mode: b, filename: s,] yields,
 	0x62 => cancel_transition [ pad: p 1,],
 	0x63 => static_sprite_flag [ slot: b, arg2: b, pad: p 1,],
 	0x64 => sprite_transform [ slot: b, scale_x: w, scale_y: w, rotation: w, pad: p 1,],
 	0x65 => transform_origin_reapply [ arg1: w, arg2: w, pad: p 1,],
 	0x66 => inlay_entry [ slot: b, scale_x: w, scale_y: w, flags: b, rotation: w, active: d, arg7: w, arg8: d, arg9: d,],
-	0x67 => scene_transition_2 [ arg1: b, arg2: b, arg3: b, arg4: d, pad: p 1,],
+	0x67 => scene_transition_2 [ arg1: b, arg2: b, arg3: b, arg4: d, pad: p 1,] yields,
 	0x68 => background_zoom [ scale_x: w, scale_y: w, center_x: w, center_y: w, pad: p 1,],
 	0x69 => movie_state_byte [ state: b, pad: p 1,],
-	0x70 => scene_transition_3 [ arg1: b, arg2: b, pad: p 1, arg4: d, pad: p 1,],  // ❌ engine reads byte @+3, which is padding here
+	0x70 => scene_transition_3 [ arg1: b, arg2: b, pad: p 1, arg4: d, pad: p 1,] yields,  // ❌ engine reads byte @+3, which is padding here
 	0x71 => filename_resource_op [ filename: s,],
 	0x72 => filename_resource_op2 [ pad: p 1,],  // ⚠ operand is only preserved by the engine
 	0x73 => load_inlay [ position_x: w, position_y: w, id: d, flags: b, filename: s,],
 	0x74 => inlay_stop [ arg1: b, pad: p 1,],
 	0x75 => inlay_move_resize [ x: w, y: w, width: w, height: w, pad: p 1,],
-	0x76 => inlay_fade_setup [ arg1: w, arg2: w, duration: d, arg4: b, arg5: b, arg6: w, arg7: d, pad: p 1,],
-	0x77 => inlay_move_animation [ x: w, y: w, duration: d, pad: p 1,],
+	0x76 => inlay_fade_setup [ arg1: w, arg2: w, duration: d, arg4: b, arg5: b, arg6: w, arg7: d, pad: p 1,] yields,
+	0x77 => inlay_move_animation [ x: w, y: w, duration: d, pad: p 1,] yields,
 	0x78 => textbox_fade_start [ percent: b, arg2: b, arg3: b, arg4: d, pad: p 1,],
 	0x79 => textbox_fade_cancel [ pad: p 1,],
 	0x81 => nop [ pad: p 2,],
-	0x82 => start_timer [ duration: w, pad: p 1,],
-	0x83 => resume [ pad: p 1,],
-	0x84 => pause [ pad: p 1,],
-	0x85 => flag_setter [ flags: b, pad: p 1,],
+	0x82 => start_duration_timer [ duration: w, pad: p 1,] yields,
+	0x83 => resume [ pad: p 1,] yields,
+	0x84 => pause [ pad: p 1,] yields,
+	0x85 => ui_screen_select [ screen: b, pad: p 1,],
 	0x86 => state_snapshot [ pad: p 2,],
 	0x87 => movie_flag_to_variable [ var_index: w, pad: p 1,],
 	0x88 => transition_flag_snapshot [ pad: p 3,],
 	0x89 => full_state_reset [ pad: p 1,],
-	0x8A => single_call [ pad: p 1,],
-	0x8B => single_call [ pad: p 1,],
+	0x8A => open_backlog_screen [ pad: p 1,] yields,
+	0x8B => open_config_screen [ pad: p 1,] yields,
 	0x8C => textbox_state_preset [ preset: w, pad: p 1,],
-	0x8D => box_state_op [ pad: p 1,],
-	0x8E => flag_setter [ pad: p 1,],
+	0x8D => box_state_op [ pad: p 1,] yields,
+	0x8E => prompt_if_var995_zero [ pad: p 1,],
 	0xA0 => background_position [ x: w, y: w, flags: b, pad: p 1,],
 	0xA1 => character_slot_position [ slot: b, x: w, y: w, flags: b, pad: p 1,],
 	0xA2 => positional_sfx_position [ slot: b, x: w, y: w, pad: p 1,],
@@ -701,34 +724,34 @@ opcode_table! {
 	0xAB => pointer_position_snapshot [ pad: p 1,],
 	0xAC => cursor_show_hide [ pad: p 1,],
 	0xAD => pointer_animation_state [ arg1: b, arg2: d, arg3: d, pad: p 1,],
-	0xAE => single_call [ pad: p 1,],
+	0xAE => release_ui_object [ pad: p 1,],
 	0xB1 => background_center [ x: w, y: w, pad: p 1,],
 	0xB2 => load_effect_file [ arg1: b, pad: p 1, filename: s,],
 	0xB3 => stop_effect [ pad: p 2,],  // ❌ engine reads byte @+1, which is padding here
 	0xB4 => effect_parameters [ pad: p 2, arg3: w, arg4: w, arg5: d, arg6: b, pad: p 1,],  // ❌ engine: bytes @+1..2 hidden in p 2
 	0xB5 => effect_frame_step [ arg1: b, arg2: b, pad: p 5,],  // ❌ engine: dword @+3..6 hidden in p 5
-	0xB6 => append_textbox_text [ mode: w, text: s,],
+	0xB6 => append_textbox_text [ mode: w, text: s,] yields,
 	0xB7 => load_slot_image [ slot: b, x: w, y: w, filename: s,],
 	0xB8 => slot_image_show_hide [ slot: b, visible: b, pad: p 1,],
 	0xB9 => per_slot_default [ slot: b, value: b, pad: p 1,],
 	0xBA => colour_effect_parameters [ arg1: w, arg2: w, arg3: b, arg4: b, arg5: b, arg6: b, arg7: b, arg8: w, text: s,],
 	0xBB => colour_effect_reset [ pad: p 1,],
 	0xBC => advance_animation_frame [ slot: b, frame: b, state: b, pad: p 1,],
-	0xBD => flag_setter [ flags: b, pad: p 1,],
+	0xBD => config_screen_gate_set [ enable: b, pad: p 1,],
 	0xBE => swap_character_slots [ slot_a: b, slot_b: b, pad: p 1,],
 	0xBF => textbox_fade_update [ arg1: b, arg2: b, arg3: b, arg4: d, pad: p 1,],
 	0xE0 => scene_text [ text: s,],
-	0xE2 => implicit_resource_op [ pad: p 1,],
+	0xE2 => implicit_resource_op [ pad: p 1,] yields,
 	0xE3 => implicit_resource_op_gated [ pad: p 1,],
-	0xE4 => textbox_mode [ mode: b, pad: p 1,],
+	0xE4 => textbox_mode [ mode: b, pad: p 1,] yields,
 	0xE5 => end_textbox_sequence [ pad: p 1,],
-	0xE6 => nop [ pad: p 2,],
+	0xE6 => nop_yield [ pad: p 2,] yields,
 	0xE7 => mark_table_entry [ table_id: w, pad: p 1,],
 	0xE8 => filename_op [ filename: s,],
 	0xE9 => filename_op_no_string [ pad: p 1,],
 	0xEA => ogg_file_op [ arg1: b, filename: s,],
 	0xEB => ogg_file_op2 [ pad: p 1,],
-	0xFF => end_of_script [ ],
+	0xFF => end_of_script [ ] yields,
 }
 
 pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
@@ -755,135 +778,135 @@ mod spec_test {
 	/// [`every_opcode_declares_its_operand_names`] until this table changes too. Whether a name is
 	/// *semantically* right is a human judgement made once against the docs; what the test enforces
 	/// is that the table and this record cannot drift apart.
-	const EXPECTED: &[(u8, &[&str])] = &[
-		(0x01, &["branch_type", "arg1", "arg2", "offset", "pad"]),
-		(0x02, &["count", "separator", "choices"]),
-		(0x03, &["kind", "var_index", "indirect", "value", "pad"]),
-		(0x04, &[]),
-		(0x05, &["arg1", "pad"]),
-		(0x06, &["target", "pad"]),
-		(0x07, &["filename"]),
-		(0x08, &["pad"]),
-		(0x09, &["filename"]),
-		(0x0A, &["pad"]),
-		(0x0B, &["seconds", "pad"]),
-		(0x0C, &["var_index", "pad"]),
-		(0x0D, &["var_index", "count", "value", "pad"]),
-		(0x0E, &["arg1", "pad"]),
-		(0x21, &["arg1", "arg2", "pan", "arg4", "arg5", "filename"]),
-		(0x22, &["arg1", "volume", "pad"]),
-		(0x23, &["flags", "slot", "frame", "arg4", "mode", "arg6", "filename"]),
-		(0x24, &["pad"]),
-		(0x25, &["slot", "repeat", "persist", "pad", "position", "arg6", "volume", "flags", "filename"]),
-		(0x26, &["slot", "pad"]),
-		(0x27, &["flags", "slot", "frame", "arg4", "mode", "arg6", "filename"]),
-		(0x28, &["slot", "position", "arg3", "pad"]),
-		(0x29, &["slot", "arg2", "pad"]),
-		(0x30, &["pan", "arg2", "pad"]),
-		(0x31, &["slot", "pad"]),
-		(0x32, &["slot", "pad"]),
-		(0x33, &["minutes", "seconds", "milliseconds", "pad"]),
-		(0x41, &["layout_id", "mode", "timer_param", "text"]),
-		(0x42, &["layout_id", "mode", "speaker_arg", "timer_param", "speaker_text", "text"]),
-		(0x43, &["slot", "x", "y", "flags", "filename"]),
-		(0x44, &["slot", "frame", "active", "pad"]),
-		(0x45, &["slot", "frame", "arg3", "pad"]),
-		(0x46, &["x", "y", "format_param", "flags", "filename"]),
-		(0x47, &["mode", "pad"]),
-		(0x48, &["slot", "x", "y", "id", "flags", "use_default", "filename"]),
-		(0x49, &["slot", "pad"]),
-		(0x4A, &["mode", "param_a", "param_b", "pad"]),
-		(0x4B, &["layer_id", "arg2", "arg3", "handle", "flag_5c", "field_84", "field_88", "pad"]),
-		(0x4C, &["flag_a", "param_a", "arg3", "param_c", "pad"]),
-		(0x4D, &["mode", "gate_arg", "count", "param_a", "param_b", "param_c", "param_d", "pad"]),
-		(0x4E, &["kind", "direction", "regen", "pad"]),
-		(0x4F, &["slot", "frame", "arg3", "pad"]),
-		(0x50, &["filename"]),
-		(0x51, &["mouse_x", "mouse_y", "pad"]),
-		(0x52, &["unused", "pad"]),
-		(0x53, &["flags", "arg1", "arg2", "filename"]),
-		(0x54, &["filename"]),
-		(0x55, &["pad"]),
-		(0x56, &["pad"]),
-		(0x57, &["arg1", "arg2", "arg3", "pad"]),
-		(0x58, &["slot", "arg2", "arg3", "arg4", "arg5", "pad"]),
-		(0x59, &["filename"]),
-		(0x60, &["pad"]),
-		(0x61, &["mode", "filename"]),
-		(0x62, &["pad"]),
-		(0x63, &["slot", "arg2", "pad"]),
-		(0x64, &["slot", "scale_x", "scale_y", "rotation", "pad"]),
-		(0x65, &["arg1", "arg2", "pad"]),
-		(0x66, &["slot", "scale_x", "scale_y", "flags", "rotation", "active", "arg7", "arg8", "arg9"]),
-		(0x67, &["arg1", "arg2", "arg3", "arg4", "pad"]),
-		(0x68, &["scale_x", "scale_y", "center_x", "center_y", "pad"]),
-		(0x69, &["state", "pad"]),
-		(0x70, &["arg1", "arg2", "pad", "arg4", "pad"]),
-		(0x71, &["filename"]),
-		(0x72, &["pad"]),
-		(0x73, &["position_x", "position_y", "id", "flags", "filename"]),
-		(0x74, &["arg1", "pad"]),
-		(0x75, &["x", "y", "width", "height", "pad"]),
-		(0x76, &["arg1", "arg2", "duration", "arg4", "arg5", "arg6", "arg7", "pad"]),
-		(0x77, &["x", "y", "duration", "pad"]),
-		(0x78, &["percent", "arg2", "arg3", "arg4", "pad"]),
-		(0x79, &["pad"]),
-		(0x81, &["pad"]),
-		(0x82, &["duration", "pad"]),
-		(0x83, &["pad"]),
-		(0x84, &["pad"]),
-		(0x85, &["flags", "pad"]),
-		(0x86, &["pad"]),
-		(0x87, &["var_index", "pad"]),
-		(0x88, &["pad"]),
-		(0x89, &["pad"]),
-		(0x8A, &["pad"]),
-		(0x8B, &["pad"]),
-		(0x8C, &["preset", "pad"]),
-		(0x8D, &["pad"]),
-		(0x8E, &["pad"]),
-		(0xA0, &["x", "y", "flags", "pad"]),
-		(0xA1, &["slot", "x", "y", "flags", "pad"]),
-		(0xA2, &["slot", "x", "y", "pad"]),
-		(0xA3, &["pad", "x", "y", "pad"]),
-		(0xA4, &["pad", "x", "y", "pad"]),
-		(0xA5, &["slot", "pad"]),
-		(0xA6, &["pad"]),
-		(0xA7, &["pad"]),
-		(0xA8, &["arg1", "arg2", "arg3", "pad", "arg4", "arg5", "arg6", "arg7", "pad"]),
-		(0xA9, &["pad"]),
-		(0xAA, &["index", "number", "pad"]),
-		(0xAB, &["pad"]),
-		(0xAC, &["pad"]),
-		(0xAD, &["arg1", "arg2", "arg3", "pad"]),
-		(0xAE, &["pad"]),
-		(0xB1, &["x", "y", "pad"]),
-		(0xB2, &["arg1", "pad", "filename"]),
-		(0xB3, &["pad"]),
-		(0xB4, &["pad", "arg3", "arg4", "arg5", "arg6", "pad"]),
-		(0xB5, &["arg1", "arg2", "pad"]),
-		(0xB6, &["mode", "text"]),
-		(0xB7, &["slot", "x", "y", "filename"]),
-		(0xB8, &["slot", "visible", "pad"]),
-		(0xB9, &["slot", "value", "pad"]),
-		(0xBA, &["arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "text"]),
-		(0xBB, &["pad"]),
-		(0xBC, &["slot", "frame", "state", "pad"]),
-		(0xBD, &["flags", "pad"]),
-		(0xBE, &["slot_a", "slot_b", "pad"]),
-		(0xBF, &["arg1", "arg2", "arg3", "arg4", "pad"]),
-		(0xE0, &["text"]),
-		(0xE2, &["pad"]),
-		(0xE3, &["pad"]),
-		(0xE4, &["mode", "pad"]),
-		(0xE5, &["pad"]),
-		(0xE6, &["pad"]),
-		(0xE7, &["table_id", "pad"]),
-		(0xE8, &["filename"]),
-		(0xE9, &["pad"]),
-		(0xEA, &["arg1", "filename"]),
-		(0xEB, &["pad"]),
-		(0xFF, &[]),
+	const EXPECTED: &[(u8, &[&str], bool)] = &[
+		(0x01, &["branch_type", "arg1", "arg2", "offset", "pad"], false),
+		(0x02, &["count", "separator", "choices"], true),
+		(0x03, &["kind", "var_index", "indirect", "value", "pad"], false),
+		(0x04, &[], true),
+		(0x05, &["arg1", "pad"], true),
+		(0x06, &["target", "pad"], false),
+		(0x07, &["filename"], false),
+		(0x08, &["pad"], true),
+		(0x09, &["filename"], false),
+		(0x0A, &["pad"], false),
+		(0x0B, &["duration_ds", "pad"], false),
+		(0x0C, &["var_index", "pad"], false),
+		(0x0D, &["var_index", "count", "value", "pad"], false),
+		(0x0E, &["arg1", "pad"], false),
+		(0x21, &["arg1", "arg2", "pan", "arg4", "arg5", "filename"], false),
+		(0x22, &["arg1", "volume", "pad"], false),
+		(0x23, &["flags", "slot", "frame", "arg4", "mode", "arg6", "filename"], false),
+		(0x24, &["pad"], false),
+		(0x25, &["slot", "repeat", "persist", "pad", "position", "arg6", "volume", "flags", "filename"], true),
+		(0x26, &["slot", "pad"], false),
+		(0x27, &["flags", "slot", "frame", "arg4", "mode", "arg6", "filename"], false),
+		(0x28, &["slot", "position", "arg3", "pad"], false),
+		(0x29, &["slot", "arg2", "pad"], false),
+		(0x30, &["pan", "arg2", "pad"], false),
+		(0x31, &["slot", "pad"], true),
+		(0x32, &["slot", "pad"], true),
+		(0x33, &["minutes", "seconds", "milliseconds", "pad"], false),
+		(0x41, &["layout_id", "mode", "timer_param", "text"], true),
+		(0x42, &["layout_id", "mode", "speaker_arg", "timer_param", "speaker_text", "text"], true),
+		(0x43, &["slot", "x", "y", "flags", "filename"], false),
+		(0x44, &["slot", "frame", "active", "pad"], true),
+		(0x45, &["slot", "frame", "arg3", "pad"], true),
+		(0x46, &["x", "y", "format_param", "flags", "filename"], false),
+		(0x47, &["mode", "pad"], false),
+		(0x48, &["slot", "x", "y", "id", "flags", "use_default", "filename"], false),
+		(0x49, &["slot", "pad"], false),
+		(0x4A, &["mode", "param_a", "param_b", "pad"], true),
+		(0x4B, &["layer_id", "arg2", "arg3", "handle", "flag_5c", "field_84", "field_88", "pad"], false),
+		(0x4C, &["flag_a", "param_a", "arg3", "param_c", "pad"], true),
+		(0x4D, &["mode", "gate_arg", "count", "param_a", "param_b", "param_c", "param_d", "pad"], false),
+		(0x4E, &["kind", "direction", "regen", "pad"], false),
+		(0x4F, &["slot", "frame", "arg3", "pad"], true),
+		(0x50, &["filename"], false),
+		(0x51, &["mouse_x", "mouse_y", "pad"], true),
+		(0x52, &["unused", "pad"], false),
+		(0x53, &["flags", "arg1", "arg2", "filename"], false),
+		(0x54, &["filename"], false),
+		(0x55, &["pad"], false),
+		(0x56, &["pad"], false),
+		(0x57, &["arg1", "arg2", "arg3", "pad"], false),
+		(0x58, &["slot", "arg2", "arg3", "arg4", "arg5", "pad"], true),
+		(0x59, &["filename"], false),
+		(0x60, &["pad"], false),
+		(0x61, &["mode", "filename"], true),
+		(0x62, &["pad"], false),
+		(0x63, &["slot", "arg2", "pad"], false),
+		(0x64, &["slot", "scale_x", "scale_y", "rotation", "pad"], false),
+		(0x65, &["arg1", "arg2", "pad"], false),
+		(0x66, &["slot", "scale_x", "scale_y", "flags", "rotation", "active", "arg7", "arg8", "arg9"], false),
+		(0x67, &["arg1", "arg2", "arg3", "arg4", "pad"], true),
+		(0x68, &["scale_x", "scale_y", "center_x", "center_y", "pad"], false),
+		(0x69, &["state", "pad"], false),
+		(0x70, &["arg1", "arg2", "pad", "arg4", "pad"], true),
+		(0x71, &["filename"], false),
+		(0x72, &["pad"], false),
+		(0x73, &["position_x", "position_y", "id", "flags", "filename"], false),
+		(0x74, &["arg1", "pad"], false),
+		(0x75, &["x", "y", "width", "height", "pad"], false),
+		(0x76, &["arg1", "arg2", "duration", "arg4", "arg5", "arg6", "arg7", "pad"], true),
+		(0x77, &["x", "y", "duration", "pad"], true),
+		(0x78, &["percent", "arg2", "arg3", "arg4", "pad"], false),
+		(0x79, &["pad"], false),
+		(0x81, &["pad"], false),
+		(0x82, &["duration", "pad"], true),
+		(0x83, &["pad"], true),
+		(0x84, &["pad"], true),
+		(0x85, &["screen", "pad"], false),
+		(0x86, &["pad"], false),
+		(0x87, &["var_index", "pad"], false),
+		(0x88, &["pad"], false),
+		(0x89, &["pad"], false),
+		(0x8A, &["pad"], true),
+		(0x8B, &["pad"], true),
+		(0x8C, &["preset", "pad"], false),
+		(0x8D, &["pad"], true),
+		(0x8E, &["pad"], false),
+		(0xA0, &["x", "y", "flags", "pad"], false),
+		(0xA1, &["slot", "x", "y", "flags", "pad"], false),
+		(0xA2, &["slot", "x", "y", "pad"], false),
+		(0xA3, &["pad", "x", "y", "pad"], false),
+		(0xA4, &["pad", "x", "y", "pad"], false),
+		(0xA5, &["slot", "pad"], false),
+		(0xA6, &["pad"], false),
+		(0xA7, &["pad"], false),
+		(0xA8, &["arg1", "arg2", "arg3", "pad", "arg4", "arg5", "arg6", "arg7", "pad"], false),
+		(0xA9, &["pad"], false),
+		(0xAA, &["index", "number", "pad"], false),
+		(0xAB, &["pad"], false),
+		(0xAC, &["pad"], false),
+		(0xAD, &["arg1", "arg2", "arg3", "pad"], false),
+		(0xAE, &["pad"], false),
+		(0xB1, &["x", "y", "pad"], false),
+		(0xB2, &["arg1", "pad", "filename"], false),
+		(0xB3, &["pad"], false),
+		(0xB4, &["pad", "arg3", "arg4", "arg5", "arg6", "pad"], false),
+		(0xB5, &["arg1", "arg2", "pad"], false),
+		(0xB6, &["mode", "text"], true),
+		(0xB7, &["slot", "x", "y", "filename"], false),
+		(0xB8, &["slot", "visible", "pad"], false),
+		(0xB9, &["slot", "value", "pad"], false),
+		(0xBA, &["arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "text"], false),
+		(0xBB, &["pad"], false),
+		(0xBC, &["slot", "frame", "state", "pad"], false),
+		(0xBD, &["enable", "pad"], false),
+		(0xBE, &["slot_a", "slot_b", "pad"], false),
+		(0xBF, &["arg1", "arg2", "arg3", "arg4", "pad"], false),
+		(0xE0, &["text"], false),
+		(0xE2, &["pad"], true),
+		(0xE3, &["pad"], false),
+		(0xE4, &["mode", "pad"], true),
+		(0xE5, &["pad"], false),
+		(0xE6, &["pad"], true),
+		(0xE7, &["table_id", "pad"], false),
+		(0xE8, &["filename"], false),
+		(0xE9, &["pad"], false),
+		(0xEA, &["arg1", "filename"], false),
+		(0xEB, &["pad"], false),
+		(0xFF, &[], true),
 	];
 
 	/// A minimal, self-consistent encoding of `spec`: opcode byte plus zeroed operands, one NUL for a
@@ -910,12 +933,19 @@ mod spec_test {
 			EXPECTED.len(),
 			"opcode count changed: update EXPECTED with the table"
 		);
-		for (spec, (byte, names)) in OPCODE_SPECS.iter().zip(EXPECTED.iter()) {
+		for (spec, (byte, names, flag)) in OPCODE_SPECS.iter().zip(EXPECTED.iter()) {
 			assert_eq!(spec.opcode, *byte, "opcode order/coverage mismatch");
 			assert_eq!(
 				spec.operands,
 				*names,
 				"operand names for 0x{:02X} ({}) disagree with the reviewed table",
+				spec.opcode,
+				spec.name
+			);
+			assert_eq!(
+				spec.yields,
+				*flag,
+				"yields for 0x{:02X} ({}) disagrees with validation/opcodes/control-flow.md",
 				spec.opcode,
 				spec.name
 			);
@@ -1019,6 +1049,7 @@ mod spec_test {
 opcode_table:
 - opcode: 0x03
   name: variable_heap_op
+  yields: false
   layout: b w b w p 1
   operands: [ kind, var_index, indirect, value, pad ]
 opcodes:

@@ -1,3 +1,4 @@
+pub mod asm;
 pub mod data;
 pub mod opcodes;
 pub mod util;
