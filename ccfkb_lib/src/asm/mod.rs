@@ -248,9 +248,20 @@ pub struct AsmOperand {
 	pub column: usize,
 }
 
+/// One choice record's operand tokens as the author wrote them: the record's own `arg1`, `text`,
+/// `gate_indirect` and `gate_value`, then its payload's operands. `ccfkb_asm_fmt` re-emits these, so
+/// a name or a literal survives formatting on a choice record exactly as it does on an instruction
+/// line.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct AsmRecord {
+	pub operands: Vec<AsmOperand>,
+	pub payload: Vec<AsmOperand>,
+}
+
 /// One instruction as it appears in the text, for tooling: its line, derived `address`, the opcode
 /// byte it resolved to, whether it carried an `addr` annotation (`annotated == false` means the line
-/// was inserted by hand), its label if any, and the [`AsmOperand`] of every operand token.
+/// was inserted by hand), its label if any, the [`AsmOperand`] of every operand token, and — for a
+/// `choice_jump` — one [`AsmRecord`] per record line that followed it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AsmItem {
 	pub line: usize,
@@ -259,6 +270,7 @@ pub struct AsmItem {
 	pub annotated: bool,
 	pub label: Option<String>,
 	pub operands: Vec<AsmOperand>,
+	pub records: Vec<AsmRecord>,
 }
 
 /// A `;` comment: its text without the `;`, the line it sits on, and the instruction it is attached
@@ -490,11 +502,22 @@ mod test {
 		jump_field(opcode.opcode, opcode.address, destination)
 	}
 
-	fn choice(arg1: u16, text: &str, marker: u8) -> Choice {
+	/// A choice record shaped like the corpus: the option is listed when heap word `gate_value` is
+	/// set, and taking it runs the `variable_heap_op` payload that stores `value` in heap word 2.
+	fn choice(arg1: u16, text: &str, gate_value: u16, value: u16) -> Choice {
 		Choice {
 			arg1,
 			choice_str: TLString { raw: text.to_owned(), translation: None, notes: None },
-			trailer: vec![marker; 11],
+			gate_indirect: 0x01,
+			gate_value,
+			payload_kind: 0x03,
+			payload: vec![
+				OpField::Byte(0x01),
+				OpField::Word(0x0002),
+				OpField::Byte(0x00),
+				OpField::Word(value),
+				OpField::Padding(vec![0x00]),
+			],
 		}
 	}
 
@@ -533,7 +556,10 @@ mod test {
 					fields: vec![
 						OpField::Byte(0x02),
 						OpField::Padding(vec![0x00]),
-						OpField::Choice(vec![choice(0x0102, "はい", 0x01), choice(0x0103, "いいえ", 0x02)]),
+						OpField::Choice(vec![
+							choice(0x0102, "はい", 0x0352, 0x0001),
+							choice(0x0103, "いいえ", 0x0353, 0x0002),
+						]),
 					],
 				},
 				Opcode {
@@ -1060,5 +1086,90 @@ end_of_script\n\n#trailer [ ]\n",
 		let script = doc.into_script().expect("both kinds fit");
 		let OpField::DWord(id) = script.opcodes[1].fields[3] else { panic!("the id operand") };
 		assert_eq!(id, 0x0001);
+	}
+
+	#[test]
+	fn a_choice_payload_is_an_opcode_of_its_own() {
+		let fixture = "# cc-fkb asm 1\n# script T.WSC\n\n\
+choice_jump count: 0x02, separator: 0x00, choices:\n  arg1: 0x0001, text: \"はい\", gate_indirect: 0x00, gate_value: 0x0001, payload: absolute_jump target: L_00000000, pad: 0x00\n  arg1: 0x0002, text: \"いいえ\", gate_indirect: 0x01, gate_value: 0x0352, payload: 0x04\n\
+\n\
+wait_rerun\n\n#trailer [ ]\n";
+		let doc = parse_document(fixture, Utf8Path::new(NAME));
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+		let OpField::Choice(choices) = &doc.script.opcodes[0].fields[2] else {
+			panic!("the instruction declares a choice list")
+		};
+		// The payload is an opcode of its own, so its jump operand is resolved by the same second
+		// pass an instruction's is.
+		assert_eq!(choices[0].payload_kind, 0x06);
+		assert_eq!(choices[0].payload.len(), 2, "a dword target and its padding byte");
+		assert!(matches!(choices[0].payload[0], OpField::DWord(0)));
+		assert!(matches!(&choices[0].payload[1], OpField::Padding(pad) if pad == &vec![0x00]));
+		// A kind the interpreter does not dispatch keeps its byte and carries no operands.
+		assert_eq!(choices[1].payload_kind, 0x04);
+		assert!(choices[1].payload.is_empty());
+
+		let text = print_document(&doc, NAME).unwrap();
+		assert!(text.contains("# label L_00000000"), "{text}");
+		assert!(
+			text.contains("payload: absolute_jump target: L_00000000, pad: 0x00"),
+			"{text}"
+		);
+		assert!(text.contains("payload: 0x04"), "{text}");
+		let again = print_document(&parse_document(&text, Utf8Path::new(NAME)), NAME).unwrap();
+		assert_eq!(again, text, "print → parse → print");
+	}
+
+	#[test]
+	fn a_payload_that_is_not_a_payload_opcode_is_reported() {
+		let cases = [
+			(
+				"wait_rerun",
+				"payload must be variable_heap_op (0x03), absolute_jump (0x06), resource_string (0x07) or a kind byte, found \"wait_rerun\"",
+			),
+			("0x03", "payload 0x03 names an opcode; write \"variable_heap_op\""),
+			(
+				"variable_heap_op kind: 0x01",
+				"variable_heap_op (0x03) takes 5 operands, found 1",
+			),
+		];
+		for (payload, expected) in cases {
+			let fixture = format!(
+				"# cc-fkb asm 1\n# script T.WSC\n\n\
+choice_jump count: 0x01, separator: 0x00, choices:\n  arg1: 0x0001, text: \"x\", gate_indirect: 0x00, gate_value: 0x0001, payload: {payload}\n\n#trailer [ ]\n"
+			);
+			let doc = parse_document(&fixture, Utf8Path::new(NAME));
+			let messages: Vec<&str> = doc.diagnostics.iter().map(|it| it.message.as_str()).collect();
+			assert!(messages.contains(&expected), "{payload}: {messages:#?}");
+		}
+	}
+
+	#[test]
+	fn fmt_keeps_a_constant_named_on_a_record() {
+		let (_dir, path) = scratch(&[
+			(
+				"T.WSC.asm",
+				"# cc-fkb asm 1\n# script T.WSC\n\n# include \"engine.inc\"\n\n\
+choice_jump count: 0x01, separator: 0x00, choices:\n  arg1: SLOT_MAIN, text: \"はい\", gate_indirect: 0x01, gate_value: ROUTE_GATE, payload: variable_heap_op kind: HEAP_SET, var_index: 0x0002, indirect: 0x00, value: 0x0001, pad: 0x00\n\n#trailer [ ]\n",
+			),
+			(
+				"engine.inc",
+				"# cc-fkb inc 1\nSLOT_MAIN = 0x0001\nROUTE_GATE = 0x0352\nHEAP_SET = 0x01\n",
+			),
+		]);
+		let doc = parse_file(&path);
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+		// A record's fields and its payload's operands are re-emitted as written, like an
+		// instruction's, so a name survives formatting.
+		let printed = print_document(&doc, NAME).unwrap();
+		assert!(printed.contains("arg1: SLOT_MAIN"), "{printed}");
+		assert!(printed.contains("gate_value: ROUTE_GATE"), "{printed}");
+		assert!(printed.contains("kind: HEAP_SET"), "{printed}");
+		assert!(printed.contains("#include \"engine.inc\""), "{printed}");
+		let script = doc.into_script().expect("the names resolve");
+		let OpField::Choice(choices) = &script.opcodes[0].fields[2] else { panic!("choice list") };
+		assert_eq!(choices[0].arg1, 0x0001);
+		assert_eq!(choices[0].gate_value, 0x0352);
+		assert!(matches!(choices[0].payload[0], OpField::Byte(0x01)));
 	}
 }

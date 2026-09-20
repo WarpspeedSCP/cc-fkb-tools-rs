@@ -26,22 +26,34 @@ use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
 use nom::Parser;
 
-use crate::opcodes::{Code, Choice, OpField, Opcode, OpcodeSpecStatic, Script, TLString, OPCODE_SPECS};
+use crate::opcodes::{
+	lookup_spec, Code, Choice, OpField, Opcode, OpcodeSpecStatic, Script, TLString, OPCODE_SPECS,
+};
 
 use super::grammar::{self, AsmError, DecodedFlag, JumpTarget, LineShape};
 use super::print::{CONST_MAGIC, MAGIC};
 use super::{
-	escape_string, finish_manifest, is_jump_field, jump_field, AsmDocument, AsmItem, AsmOperand,
-	Comment, CommentAnchor, Constant, ConstantTable, ConstantValue, Diagnostic, Include, Severity,
-	Source, SourceKind,
+	escape_string, finish_manifest, is_jump_field, jump_field, operand_labels, AsmDocument, AsmItem,
+	AsmOperand, AsmRecord, Comment, CommentAnchor, Constant, ConstantTable, ConstantValue,
+	Diagnostic, Include, Severity, Source, SourceKind,
 };
 
 /// A jump operand whose value can only be filled once every instruction address is known.
 struct PendingJump<'a> {
 	opcode_index: usize,
+	slot: JumpSlot,
 	line: usize,
 	column: usize,
 	token: &'a str,
+}
+
+/// Where a jump operand's dword lives: on the instruction itself, or in the payload of one of its
+/// choice records. A payload is an opcode of its own spelled inside a record, and its jump operand is
+/// resolved by the same second pass, so it prints as the same `L_<hex>` label.
+#[derive(Clone, Copy)]
+enum JumpSlot {
+	Instruction,
+	Payload { field_index: usize, choice_index: usize, operand_index: usize },
 }
 
 /// The annotations of one instruction's block, applied when the instruction line arrives.
@@ -194,7 +206,7 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 	let mut label_lines: BTreeMap<String, usize> = BTreeMap::new();
 	let mut jumps: Vec<PendingJump> = vec![];
 	let mut address = 0usize;
-	let mut choice_slot: Option<(usize, usize)> = None;
+	let mut choice_slot: Option<(usize, usize, usize)> = None;
 	let mut trailer_line: Option<usize> = None;
 
 	let has_content = text.lines().any(|it| !it.trim().is_empty());
@@ -264,19 +276,29 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 						1,
 						"choice record with no preceding \"choices:\" block".to_owned(),
 					)),
-					Some((opcode_index, field_index)) => {
+					Some((opcode_index, field_index, item_index)) => {
 						let mut findings = Vec::new();
-						match choice_record(text, &segments, &constants, &mut findings) {
-							Ok(choice) => {
-								if choice.trailer.len() != 11 {
-									out.diagnostics.push(flag(
-										number,
-										1,
-										format!(
-											"choice trailer is {} bytes; the decoder always reads 11",
-											choice.trailer.len()
-										),
-									));
+						let choice_index = match &out.script.opcodes[opcode_index].fields[field_index]
+						{
+							OpField::Choice(choices) => choices.len(),
+							_ => 0,
+						};
+						match choice_record(raw, number, text, &segments, &constants, &mut findings) {
+							Ok((choice, record, payload_jumps)) => {
+								// A payload jump is resolved by the same pass as an instruction's, so
+								// its token is queued the same way.
+								for (operand_index, token) in payload_jumps {
+									jumps.push(PendingJump {
+										opcode_index,
+										slot: JumpSlot::Payload {
+											field_index,
+											choice_index,
+											operand_index,
+										},
+										line: number,
+										column: grammar::column_of(raw, token),
+										token,
+									});
 								}
 								if let OpField::Choice(choices) =
 									&mut out.script.opcodes[opcode_index].fields[field_index]
@@ -286,6 +308,9 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 									// with them.
 									address += choice.size();
 									choices.push(choice);
+								}
+								if let Some(item) = out.items.get_mut(item_index) {
+									item.records.push(record);
 								}
 							}
 							Err(message) => out.diagnostics.push(error(number, 1, message)),
@@ -407,6 +432,7 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 							column: grammar::column_of(raw, slice),
 						})
 						.collect(),
+					records: Vec::new(),
 				};
 				for (name, line, column) in &pending.labels {
 					if let Some(first) = label_lines.get(name) {
@@ -455,7 +481,13 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 						.get(field_index)
 						.map(|(_, slice, _)| grammar::column_of(raw, slice))
 						.unwrap_or_else(|| grammar::column_of(raw, operands));
-					jumps.push(PendingJump { opcode_index, line: number, column, token });
+					jumps.push(PendingJump {
+						opcode_index,
+						slot: JumpSlot::Instruction,
+						line: number,
+						column,
+						token,
+					});
 				}
 				let mut size = 1usize;
 				for field in &fields {
@@ -467,7 +499,9 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 						.iter()
 						.position(|it| matches!(it, Code::Choice))
 						.unwrap_or_default();
-					choice_slot = Some((opcode_index, field_index));
+					// The records of this instruction arrive on the lines below it, so the slot keeps
+					// where they land: the opcode, the field, and the item the tokens are recorded on.
+					choice_slot = Some((opcode_index, field_index, out.items.len()));
 				}
 				out.script.opcodes.push(Opcode {
 					opcode: spec.opcode,
@@ -882,52 +916,170 @@ fn trailing_hash(line: usize) -> Diagnostic {
 	)
 }
 
-/// One choice record line's `arg1`, `text` and `trailer`, in the order they are written. The record's
-/// own parser reports the first problem it meets, so the parts are read left to right and a value
-/// the format rejects keeps its own message; everything else (a part with no `:`, a label the record
-/// does not define, a missing label) is an unrecognized line.
+/// The payload opcodes as the format spells them, built from the table so a rename cannot leave a
+/// message behind.
+fn payload_kinds_spelled() -> String {
+	Choice::PAYLOAD_KINDS
+		.iter()
+		.filter_map(|kind| lookup_spec(*kind))
+		.map(|spec| format!("{} (0x{:02X})", spec.name, spec.opcode))
+		.collect::<Vec<String>>()
+		.join(", ")
+}
+
+/// One choice record line: the option's `arg1` and text, the availability gate the interpreter
+/// evaluates before listing it, and the payload — the byte pattern of another opcode, which the
+/// interpreter runs on this record when the option is taken.
+///
+/// Returns the record, its operand tokens as written (which `ccfkb_asm_fmt` re-emits, so a name or a
+/// literal survives formatting exactly as it does on an instruction line) and its payload's jump
+/// operands, which the driver resolves once every address is known.
+///
+/// The record's four fields are written in the order of the bytes and the payload is last, so its
+/// operand list runs to the end of the line. The parser reports the first problem it meets, so a
+/// value the format rejects keeps its own message; a part with no top-level `:`, a label the record
+/// does not define, a field out of order or a missing field are all an unrecognized line.
 fn choice_record<'a>(
+	raw: &'a str,
+	line: usize,
 	text: &'a str,
 	segments: &[&'a str],
-	constants: &ConstantTable,
+	constants: &'a ConstantTable,
 	findings: &mut Vec<DecodedFlag<'a>>,
-) -> Result<Choice, String> {
+) -> Result<(Choice, AsmRecord, Vec<(usize, &'a str)>), String> {
+	/// The record's own fields, in the order the bytes are: the two the option needs, then the gate.
+	const FIELDS: [&str; 4] = ["arg1", "text", "gate_indirect", "gate_value"];
 	let unrecognized = || format!("unrecognized line: \"{text}\"");
-	let mut arg1 = None;
-	let mut choice_str = None;
-	let mut trailer = None;
+	// Each part is its label, the operand as written (a payload's operand is passed on whole) and the
+	// value token alone.
+	let mut parts: Vec<(&'a str, &'a str, &'a str)> = Vec::new();
 	for segment in segments.iter().copied() {
 		let Ok((_, (label, value))) = grammar::label_value(segment) else {
 			return Err(unrecognized());
 		};
-		match label {
-			"arg1" => {
-				arg1 = Some(
-					grammar::value_of(
-						grammar::hex_value("arg1", 4, "a 2-byte hex literal", constants, findings)
-							.parse(value),
-					)? as u16,
-				);
-			}
-			"text" => {
-				choice_str = Some(grammar::value_of(
-					grammar::string_operand("text", constants).parse(value),
-				)?)
-			}
-			"trailer" => {
-				trailer = Some(grammar::value_of(grammar::byte_list_value(value, constants))?)
-			}
-			_ => return Err(unrecognized()),
-		}
+		parts.push((label, segment.trim(), value));
 	}
-	let (Some(arg1), Some(choice_str), Some(trailer)) = (arg1, choice_str, trailer) else {
+	let Some(payload_at) = parts.iter().position(|(label, _, _)| *label == "payload") else {
 		return Err(unrecognized());
 	};
-	Ok(Choice {
-		arg1,
-		choice_str: TLString { raw: choice_str, translation: None, notes: None },
-		trailer,
-	})
+	let head = &parts[..payload_at];
+	if head.len() != FIELDS.len()
+		|| head.iter().zip(FIELDS).any(|((label, _, _), want)| *label != want)
+	{
+		return Err(unrecognized());
+	}
+	let field = |index: usize| head[index].2;
+	let arg1 = grammar::value_of(
+		grammar::hex_value("arg1", 4, "a 2-byte hex literal", constants, findings).parse(field(0)),
+	)? as u16;
+	let choice_str =
+		grammar::value_of(grammar::string_operand("text", constants).parse(field(1)))?;
+	let gate_indirect = grammar::value_of(
+		grammar::hex_value("gate_indirect", 2, "a 1-byte hex literal", constants, findings)
+			.parse(field(2)),
+	)? as u8;
+	let gate_value = grammar::value_of(
+		grammar::hex_value("gate_value", 4, "a 2-byte hex literal", constants, findings)
+			.parse(field(3)),
+	)? as u16;
+
+	// The payload is an opcode of its own, so its operand list is that opcode's: the text after its
+	// mnemonic, then every field the record spells after `payload:`.
+	let payload_text = parts[payload_at].2;
+	let (mnemonic, region) =
+		grammar::value_of(grammar::instruction(payload_text)).map_err(|_| unrecognized())?;
+	let spec = OPCODE_SPECS
+		.iter()
+		.find(|it| it.name == mnemonic && Choice::PAYLOAD_KINDS.contains(&it.opcode));
+	let (payload_kind, payload, payload_tokens, payload_jumps) = match spec {
+		Some(spec) => {
+			let operands: Vec<&'a str> = std::iter::once(region)
+				.chain(parts[payload_at + 1..].iter().map(|(_, operand, _)| *operand))
+				.collect();
+			if operands.len() != spec.operands.len() {
+				return Err(grammar::operand_count_message(spec, operands.len()));
+			}
+			let labels = operand_labels(spec.operands);
+			let mut fields = Vec::with_capacity(spec.layout.len());
+			let mut tokens = Vec::with_capacity(spec.layout.len());
+			let mut jumps = Vec::new();
+			for (index, operand) in operands.iter().enumerate() {
+				let (field, jump) = grammar::value_of(grammar::operand_field(
+					spec,
+					&labels,
+					index,
+					operand,
+					constants,
+					findings,
+				))?;
+				let value = match grammar::label_value(operand) {
+					Ok((_, (_, value))) => value,
+					Err(_) => operand,
+				};
+				tokens.push(AsmOperand {
+					label: labels[index].clone(),
+					text: value.to_owned(),
+					line,
+					column: grammar::column_of(raw, value),
+				});
+				if let Some(jump) = jump {
+					jumps.push((index, jump));
+				}
+				fields.push(field);
+			}
+			(spec.opcode, fields, tokens, jumps)
+		}
+		None => {
+			// A kind the interpreter does not dispatch carries no operand bytes, so it is written as
+			// the byte itself and nothing follows it.
+			let kind = (region.trim().is_empty() && payload_at + 1 == parts.len())
+				.then(|| {
+					grammar::value_of(
+						grammar::hex_value("payload", 2, "a 1-byte hex literal", constants, findings)
+							.parse(mnemonic),
+					)
+					.ok()
+				})
+				.flatten();
+			match kind {
+				Some(kind) if Choice::PAYLOAD_KINDS.contains(&(kind as u8)) => {
+					return Err(format!(
+						"payload {kind:#04X} names an opcode; write \"{}\"",
+						lookup_spec(kind as u8).map(|it| it.name).unwrap_or_default()
+					));
+				}
+				Some(kind) => (kind as u8, Vec::new(), Vec::new(), Vec::new()),
+				None => {
+					return Err(format!(
+						"payload must be {} or a kind byte, found \"{payload_text}\"",
+						payload_kinds_spelled()
+					));
+				}
+			}
+		}
+	};
+
+	let operands: Vec<AsmOperand> = head
+		.iter()
+		.map(|(label, _, value)| AsmOperand {
+			label: (*label).to_owned(),
+			text: (*value).to_owned(),
+			line,
+			column: grammar::column_of(raw, value),
+		})
+		.collect();
+	Ok((
+		Choice {
+			arg1,
+			choice_str: TLString { raw: choice_str, translation: None, notes: None },
+			gate_indirect,
+			gate_value,
+			payload_kind,
+			payload,
+		},
+		AsmRecord { operands, payload: payload_tokens },
+		payload_jumps,
+	))
 }
 
 /// Applies one annotation to the block of annotations the instruction below it will use. A value the
@@ -1073,9 +1225,36 @@ fn resolve_jumps(out: &mut AsmDocument, jumps: &[PendingJump]) {
 				message,
 			));
 		}
-		let field_index = if is_jump_field(opcode, 0) { 0 } else { 3 };
-		if let Some(field) = out.script.opcodes[pending.opcode_index].fields.get_mut(field_index) {
-			*field = OpField::DWord(jump_field(opcode, instruction_address, destination));
+		match pending.slot {
+			JumpSlot::Instruction => {
+				let field_index = if is_jump_field(opcode, 0) { 0 } else { 3 };
+				let value = jump_field(opcode, instruction_address, destination);
+				if let Some(field) =
+					out.script.opcodes[pending.opcode_index].fields.get_mut(field_index)
+				{
+					*field = OpField::DWord(value);
+				}
+			}
+			JumpSlot::Payload { field_index, choice_index, operand_index } => {
+				// A payload jump is an `absolute_jump` written inside a record, so its value is the
+				// destination itself: the record has no address of its own to measure from.
+				let kind = match &out.script.opcodes[pending.opcode_index].fields[field_index] {
+					OpField::Choice(choices) => choices.get(choice_index).map(|it| it.payload_kind),
+					_ => None,
+				};
+				let Some(kind) = kind else { continue };
+				let value = jump_field(kind, instruction_address, destination);
+				if let Some(OpField::Choice(choices)) =
+					out.script.opcodes[pending.opcode_index].fields.get_mut(field_index)
+				{
+					if let Some(field) = choices
+						.get_mut(choice_index)
+						.and_then(|choice| choice.payload.get_mut(operand_index))
+					{
+						*field = OpField::DWord(value);
+					}
+				}
+			}
 		}
 	}
 }

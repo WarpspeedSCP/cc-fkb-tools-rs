@@ -4,7 +4,10 @@
 //! `print → parse → print` is textually identical and `script → asm → script` preserves `opcodes`
 //! and `trailer`: the manifest is rebuilt by `manifest_for` on parse, `# addr` is derived from
 //! `Opcode::size()`, and a string's `raw` text is what the operand prints (a `translation`, when
-//! present, is emitted as its own annotation, so the bytes still come from the model).
+//! present, is emitted as its own annotation, so the bytes still come from the model). A choice
+//! record prints its gate and its payload, the payload opcode named and valued by its own row of the
+//! table — and a token the author wrote (`arg1: SLOT_MAIN`, a payload's `value`) is re-emitted as it
+//! stands, exactly as an instruction operand's is.
 //!
 //! Beside a constants table, the same emitter names values instead of spelling them:
 //! [`print_script_with_constants`] is what `ccfkb_disassemble` uses when it is given a `.inc` file,
@@ -16,11 +19,11 @@ use std::collections::BTreeSet;
 
 use anyhow::bail;
 
-use crate::opcodes::{lookup_spec, Code, OpField, OpcodeSpecStatic, Script};
+use crate::opcodes::{lookup_spec, Choice, Code, OpField, OpcodeSpecStatic, Script};
 
 use super::{
-	escape_string, is_jump_field, jump_destination, operand_labels, AsmDocument, AsmItem, Comment,
-	CommentAnchor, ConstantTable,
+	escape_string, is_jump_field, jump_destination, operand_labels, AsmDocument, AsmItem, AsmRecord,
+	Comment, CommentAnchor, ConstantTable,
 };
 
 /// Line 1 of every script, the only accepted version.
@@ -234,6 +237,24 @@ fn jump_destinations(script: &Script, addresses: &[usize]) -> BTreeSet<usize> {
 				out.insert(destination);
 			}
 		}
+		// A choice record's payload is an opcode of its own, so an `absolute_jump` written there names
+		// the same kind of destination an instruction's does — and gets the same `# label` line.
+		for field in &opcode.fields {
+			let OpField::Choice(choices) = field else {
+				continue;
+			};
+			for choice in choices {
+				if !is_jump_field(choice.payload_kind, 0) {
+					continue;
+				}
+				if let Some(field) = choice.payload.first().and_then(dword_of) {
+					if let Some(destination) = jump_destination(choice.payload_kind, *address, field)
+					{
+						out.insert(destination);
+					}
+				}
+			}
+		}
 	}
 	out
 }
@@ -282,19 +303,13 @@ fn print_instruction(
 					spec.name
 				);
 			};
-			for choice in choices {
-				if choice.trailer.len() != 11 {
-					log::warn!(
-						"choice trailer at 0x{address:08X} is {} bytes; the decoder always reads 11",
-						choice.trailer.len()
-					);
-				}
-				choice_records.push(format!(
-					"  arg1: 0x{:04X}, text: \"{}\", trailer: {}",
-					choice.arg1,
-					escape_string(&choice.choice_str.raw),
-					byte_list(&choice.trailer)
-				));
+			for (index, choice) in choices.iter().enumerate() {
+				choice_records.push(print_choice(
+					choice,
+					address,
+					item.and_then(|it| it.records.get(index)),
+					constants,
+				)?);
 			}
 			continue;
 		}
@@ -313,6 +328,85 @@ fn print_instruction(
 	}
 	lines.extend(choice_records);
 	Ok(lines)
+}
+
+/// One choice record: the option's `arg1` and text, the availability gate the interpreter evaluates
+/// before listing it, and the payload — the byte pattern of another opcode, which the interpreter
+/// runs on this record when the option is taken. A payload opcode's own operand names and canonical
+/// values come from its row of the table, so a record reads exactly like an instruction.
+///
+/// A token the author wrote is re-emitted as it stands; a record of a hand-built script carries no
+/// tokens and is rendered canonically.
+fn print_choice(
+	choice: &Choice,
+	address: usize,
+	record: Option<&AsmRecord>,
+	constants: Option<&ConstantTable>,
+) -> anyhow::Result<String> {
+	let token = |index: usize| {
+		record
+			.and_then(|it| it.operands.get(index))
+			.map(|it| it.text.clone())
+	};
+	let arg1 = token(0).unwrap_or_else(|| {
+		named_number(constants, choice.arg1 as u64, 2, "arg1")
+			.unwrap_or_else(|| format!("0x{:04X}", choice.arg1))
+	});
+	let text = token(1).unwrap_or_else(|| {
+		constants
+			.and_then(|it| it.name_for_text(&choice.choice_str.raw))
+			.map(|it| it.to_owned())
+			.unwrap_or_else(|| format!("\"{}\"", escape_string(&choice.choice_str.raw)))
+	});
+	let gate_indirect = token(2).unwrap_or_else(|| {
+		named_number(constants, choice.gate_indirect as u64, 1, "gate_indirect")
+			.unwrap_or_else(|| format!("0x{:02X}", choice.gate_indirect))
+	});
+	let gate_value = token(3).unwrap_or_else(|| {
+		named_number(constants, choice.gate_value as u64, 2, "gate_value")
+			.unwrap_or_else(|| format!("0x{:04X}", choice.gate_value))
+	});
+	let mut line = format!(
+		"  arg1: {arg1}, text: {text}, gate_indirect: {gate_indirect}, gate_value: {gate_value}, payload: "
+	);
+
+	let spec = lookup_spec(choice.payload_kind)
+		.filter(|it| Choice::PAYLOAD_KINDS.contains(&it.opcode));
+	match spec {
+		Some(spec) => {
+			if choice.payload.len() != spec.layout.len() {
+				bail!(
+					"choice payload at 0x{address:08X} has {} fields but {} declares {}",
+					choice.payload.len(),
+					spec.name,
+					spec.layout.len()
+				);
+			}
+			let labels = operand_labels(spec.operands);
+			let mut printed = Vec::with_capacity(spec.layout.len());
+			for (index, (code, field)) in spec.layout.iter().zip(choice.payload.iter()).enumerate() {
+				let value = match record.and_then(|it| it.payload.get(index)) {
+					Some(operand) => operand.text.clone(),
+					None => print_value(spec, index, code, field, address, constants)?,
+				};
+				printed.push(format!("{}: {value}", labels[index]));
+			}
+			line.push_str(&format!("{} {}", spec.name, printed.join(", ")));
+		}
+		None => {
+			// A kind the interpreter does not dispatch carries no operand bytes: it is written as the
+			// byte itself, and no opcode names it.
+			if !choice.payload.is_empty() {
+				bail!(
+					"choice payload at 0x{address:08X} has kind 0x{:02X}, which carries no operands, but holds {} fields",
+					choice.payload_kind,
+					choice.payload.len()
+				);
+			}
+			line.push_str(&format!("0x{:02X}", choice.payload_kind));
+		}
+	}
+	Ok(line)
 }
 
 /// One operand, canonically: a literal for every number, and a `L_<hex>` label for a jump

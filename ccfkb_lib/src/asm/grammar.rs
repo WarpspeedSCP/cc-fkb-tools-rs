@@ -657,6 +657,84 @@ pub(crate) struct Decoded<'a> {
 	pub flags: Vec<DecodedFlag<'a>>,
 }
 
+/// The message a row reports when a line spells the wrong number of operands. Shared so an
+/// instruction line and a choice record's payload report the same thing.
+pub(crate) fn operand_count_message(spec: &OpcodeSpecStatic, found: usize) -> String {
+	format!(
+		"{} (0x{:02X}) takes {} operands, found {}",
+		spec.name,
+		spec.opcode,
+		spec.operands.len(),
+		found
+	)
+}
+
+/// One operand of an instruction line against one row of the opcode table: the label it must spell,
+/// the field its value produces, and — for a jump operand — the token the driver resolves once every
+/// address is known.
+///
+/// Which label, which value and which message a row implies come from the row alone, so this is the
+/// one place those three are decided: an instruction line and a choice record's payload both come
+/// through it.
+pub(crate) fn operand_field<'a>(
+	spec: &'static OpcodeSpecStatic,
+	labels: &[String],
+	index: usize,
+	operand: &'a str,
+	constants: &'a ConstantTable,
+	flags: &mut Vec<DecodedFlag<'a>>,
+) -> PResult<'a, (OpField, Option<&'a str>)> {
+	let label = &labels[index];
+	// An operand with no top-level `:` is reported by its label check, which names it.
+	let (found, value) = match label_value(operand) {
+		Ok((_, it)) => it,
+		Err(_) => (operand, ""),
+	};
+	if found != label {
+		let order: Vec<String> = labels.iter().map(|it| format!("\"{it}\"")).collect();
+		return fail(
+			operand,
+			format!(
+				"operand {index} is \"{found}\"; {} (0x{:02X}) expects \"{label}\" (order: {})",
+				spec.name,
+				spec.opcode,
+				order.join(", ")
+			),
+		);
+	}
+	let mut jump_token = None;
+	let field = match spec.layout[index] {
+		Code::Byte => OpField::Byte(
+			hex_value(label, 2, "a 1-byte hex literal", constants, flags).parse(value)?.1 as u8,
+		),
+		Code::Word => OpField::Word(
+			hex_value(label, 4, "a 2-byte hex literal", constants, flags).parse(value)?.1 as u16,
+		),
+		Code::DWord => {
+			if is_jump_field(spec.opcode, index) {
+				jump_token = Some(value);
+				OpField::DWord(0)
+			} else {
+				OpField::DWord(
+					hex_value(label, 8, "a 4-byte hex literal", constants, flags).parse(value)?.1,
+				)
+			}
+		}
+		Code::Str => OpField::String(TLString {
+			raw: string_operand(label, constants).parse(value)?.1,
+			translation: None,
+			notes: None,
+		}),
+		Code::Padding(size) => {
+			OpField::Padding(padding_value(label, size, constants, flags).parse(value)?.1)
+		}
+		// The records arrive on the lines that follow the instruction; the value here names
+		// nothing (the printer writes `choices:` with nothing after it).
+		Code::Choice => OpField::Choice(vec![]),
+	};
+	Ok(("", (field, jump_token)))
+}
+
 /// Parses one instruction line's operand region against one row of the opcode table. Which labels and
 /// which values a region holds depends only on the row, so this is the parser that owns the
 /// operand-count, operand-label/order and value messages.
@@ -671,81 +749,27 @@ pub(crate) fn row_values<'a>(
 		let labels = operand_labels(spec.operands);
 		let operands = segments(input);
 		if operands.len() != spec.operands.len() {
-			return fail(
-				input,
-				format!(
-					"{} (0x{:02X}) takes {} operands, found {}",
-					spec.name,
-					spec.opcode,
-					spec.operands.len(),
-					operands.len()
-				),
-			);
+			return fail(input, operand_count_message(spec, operands.len()));
 		}
-		let order: Vec<String> = labels.iter().map(|it| format!("\"{it}\"")).collect();
 		let mut fields = Vec::with_capacity(spec.layout.len());
 		let mut spans = Vec::with_capacity(spec.layout.len());
 		let mut jump_tokens = Vec::new();
 		let mut flags: Vec<DecodedFlag<'a>> = Vec::new();
 		for (index, operand) in operands.iter().enumerate() {
 			let operand = operand.trim();
-			let label = &labels[index];
-			// An operand with no top-level `:` is reported by its label check, which names it.
-			let (found, value) = match label_value(operand) {
-				Ok((_, it)) => it,
-				Err(_) => (operand, ""),
-			};
-			if found != label {
-				return fail(
-					operand,
-					format!(
-						"operand {index} is \"{found}\"; {} (0x{:02X}) expects \"{label}\" (order: {})",
-						spec.name,
-						spec.opcode,
-						order.join(", ")
-					),
-				);
-			}
-			spans.push((label.clone(), operand, value));
-			let code = spec.layout[index];
-			if matches!(code, Code::Choice) && index + 1 < spec.layout.len() {
+			if matches!(spec.layout[index], Code::Choice) && index + 1 < spec.layout.len() {
 				return fail(operand, "\"choices:\" must be the last operand on the line");
 			}
-			let field = match code {
-				Code::Byte => OpField::Byte(
-					hex_value(label, 2, "a 1-byte hex literal", constants, &mut flags)
-						.parse(value)?
-						.1 as u8,
-				),
-				Code::Word => OpField::Word(
-					hex_value(label, 4, "a 2-byte hex literal", constants, &mut flags)
-						.parse(value)?
-						.1 as u16,
-				),
-				Code::DWord => {
-					if is_jump_field(spec.opcode, index) {
-						jump_tokens.push((index, value));
-						OpField::DWord(0)
-					} else {
-						OpField::DWord(
-							hex_value(label, 8, "a 4-byte hex literal", constants, &mut flags)
-								.parse(value)?
-								.1,
-						)
-					}
-				}
-				Code::Str => OpField::String(TLString {
-					raw: string_operand(label, constants).parse(value)?.1,
-					translation: None,
-					notes: None,
-				}),
-				Code::Padding(size) => {
-					OpField::Padding(padding_value(label, size, constants, &mut flags).parse(value)?.1)
-				}
-				// The records arrive on the lines that follow the instruction; the value here names
-				// nothing (the printer writes `choices:` with nothing after it).
-				Code::Choice => OpField::Choice(vec![]),
+			let (_, (field, jump)) =
+				operand_field(spec, &labels, index, operand, constants, &mut flags)?;
+			let value = match label_value(operand) {
+				Ok((_, (_, value))) => value,
+				Err(_) => "",
 			};
+			spans.push((labels[index].clone(), operand, value));
+			if let Some(token) = jump {
+				jump_tokens.push((index, token));
+			}
 			fields.push(field);
 		}
 		Ok(("", Decoded { fields, spans, jump_tokens, flags }))

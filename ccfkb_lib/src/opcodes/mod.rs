@@ -89,16 +89,35 @@ impl OpField {
 	}
 }
 
+/// One option of a `0x02 choice_jump` list.
+///
+/// After the option's text the record carries the **availability condition** the interpreter
+/// evaluates before the option is listed — `gate_indirect != 0 ? heap[gate_value] != 0 :
+/// gate_value != 0` — and then a **payload**: the byte pattern of another opcode, which the
+/// interpreter runs on this record when the option is taken. `payload_kind` is that opcode;
+/// [`Choice::PAYLOAD_KINDS`] are the three the interpreter dispatches, and any other kind carries no
+/// operand bytes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Choice {
 	#[serde(serialize_with = "crate::opcodes::serialize_hex_u16")]
 	pub arg1: u16,
 	pub choice_str: TLString,
-	#[serde(serialize_with = "crate::opcodes::serialize_inline_ints_vec")]
-	pub trailer: Vec<u8>,
+	#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
+	pub gate_indirect: u8,
+	#[serde(serialize_with = "crate::opcodes::serialize_hex_u16")]
+	pub gate_value: u16,
+	#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
+	pub payload_kind: u8,
+	/// The payload opcode's operand fields, decoded with its own row of the opcode table. Empty for
+	/// every kind the interpreter does not dispatch.
+	pub payload: Vec<OpField>,
 }
 
 impl Choice {
+	/// The opcodes the interpreter runs as a choice payload: `variable_heap_op`, `absolute_jump` and
+	/// `resource_string`.
+	pub(crate) const PAYLOAD_KINDS: [u8; 3] = [0x03, 0x06, 0x07];
+
 	pub(crate) fn size(&self) -> usize {
 		let str_len = if let Some(tl) = &self.choice_str.translation {
 			encode_sjis(tl).len() + 1
@@ -106,13 +125,18 @@ impl Choice {
 			encode_sjis(&self.choice_str.raw).len() + 1
 		};
 
-		2 + str_len + self.trailer.len()
+		2 + str_len + 3 + 1 + self.payload.iter().map(|it| it.size()).sum::<usize>()
 	}
 	fn binary_serialise(&self) -> Vec<u8> {
 		let mut buf = vec![];
 		buf.extend(self.arg1.to_le_bytes());
 		buf.extend(self.choice_str.bytecode_serialise());
-		buf.extend(&self.trailer);
+		buf.push(self.gate_indirect);
+		buf.extend(self.gate_value.to_le_bytes());
+		buf.push(self.payload_kind);
+		for field in &self.payload {
+			buf.extend(field.binary_serialise());
+		}
 		buf
 	}
 }
@@ -485,26 +509,65 @@ pub fn validate_opcode_table(script: &Script) -> Result<(), String> {
 	Ok(())
 }
 
-fn make_choice(input: &[u8]) -> Choice {
-	let mut ptr = 0;
+/// Where a payload opcode's operands end, given the row that describes them, or `None` when the
+/// buffer runs out first — including a string with no terminator. The interpreter advances by the
+/// same bytes (`add ebp, 3` for the gate, one for the kind, then the payload opcode's own operands).
+fn payload_end(spec: &OpcodeSpecStatic, input: &[u8], start: usize) -> Option<usize> {
+	let mut ptr = start;
+	for code in spec.layout {
+		ptr = match code {
+			Code::Byte => ptr + 1,
+			Code::Word => ptr + 2,
+			Code::DWord => ptr + 4,
+			Code::Padding(size) => ptr + *size as usize,
+			Code::Str => ptr + input.get(ptr..)?.iter().position(|it| *it == 0)? + 1,
+			// A payload opcode is never a choice list, so there is no payload to find.
+			Code::Choice => return None,
+		};
+		if ptr > input.len() {
+			return None;
+		}
+	}
+	Some(ptr)
+}
 
-	let arg1 = transmute_to_u16(ptr, input);
-	ptr += 2;
+/// One choice record, from its `arg1` through its payload. The record is read by kind, so a kind the
+/// interpreter does not dispatch consumes its one byte and nothing else; a record the script runs out
+/// of is reported and dropped instead of reading past the end.
+fn make_choice(input: &[u8]) -> Option<Choice> {
+	let arg1 = transmute_to_u16(0, input);
+	let (bytes, choice_str) = get_sjis_bytes(2, input);
+	let mut ptr = 2 + bytes.len();
 
-	let (bytes, choice_str) = get_sjis_bytes(ptr, input);
-	ptr += bytes.len();
+	if input.len() < ptr + 4 {
+		log::error!("choice record at {ptr} runs past the end of the script");
+		return None;
+	}
+	let gate_indirect = input[ptr];
+	let gate_value = transmute_to_u16(ptr + 1, input);
+	ptr += 3;
 
-	let trailer = &input[ptr..(ptr + 11)];
+	let payload_kind = input[ptr];
+	let mut payload = Vec::new();
+	if Choice::PAYLOAD_KINDS.contains(&payload_kind) {
+		let spec = lookup_spec(payload_kind)?;
+		let end = payload_end(spec, input, ptr + 1)?;
+		payload = decode_opcode_fields(payload_kind, &input[ptr..])?;
+		debug_assert_eq!(end, ptr + 1 + payload.iter().map(|it| it.size()).sum::<usize>());
+	}
 
-	Choice {
+	Some(Choice {
 		arg1,
 		choice_str: TLString {
 			raw: choice_str,
 			translation: None,
 			notes: None,
 		},
-		trailer: trailer.to_vec(),
-	}
+		gate_indirect,
+		gate_value,
+		payload_kind,
+		payload,
+	})
 }
 
 /// Maps a layout code token to a [`Code`] in const context.
@@ -557,7 +620,7 @@ macro_rules! decode_components {
 			let mut choices = vec![];
 			let mut curr_ptr = $ptr;
 			for _ in 0..n_choices {
-				let choice = make_choice(&$input[curr_ptr..]);
+				let choice = make_choice(&$input[curr_ptr..])?;
 				curr_ptr += choice.size();
 				choices.push(choice);
 			}
@@ -625,7 +688,7 @@ macro_rules! opcode_table {
 
 opcode_table! {
 	0x01 => conditional_branch [ branch_type: b, arg1: w, arg2: w, offset: d, pad: p 1,],
-	0x02 => choice_jump [ count: b, separator: p 1, choices: c,] yields,  // ❌ choice-list trailer byte the engine reads is padding in the Rust arm
+	0x02 => choice_jump [ count: b, separator: p 1, choices: c,] yields,  // each record: gate (flag + u16), then the byte pattern of opcode 3, 6 or 7 as the payload
 	0x03 => variable_heap_op [ kind: b, var_index: w, indirect: b, value: w, pad: p 1,],
 	0x04 => wait_rerun [ ] yields,
 	0x05 => movie_overlay_flag [ arg1: b, pad: p 1,] yields,
@@ -1097,5 +1160,31 @@ trailer: [  ]
 		};
 		let err = validate_opcode_table(&missing).expect_err("unlisted opcode must be rejected");
 		assert!(err.contains("missing from opcode_table"), "{err}");
+	}
+
+	#[test]
+	fn a_choice_record_is_read_by_kind_and_never_past_the_end() {
+		// One record: `arg1`, an empty text, the availability gate (flag + u16), the payload kind and
+		// the payload opcode's own operands.
+		let complete = [
+			0x02, 0x01, 0x00, // opcode, count, separator
+			0x01, 0x00, // arg1
+			0x00, // the option's text
+			0x01, 0x00, 0x00, // gate: a heap index
+			0x03, // payload kind: variable_heap_op
+			0x01, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, // its kind, var_index, indirect, value, pad
+		];
+		let opcode = make_opcode(&complete, 0).expect("a complete record decodes");
+		let OpField::Choice(choices) = &opcode.fields[2] else { panic!("choice list") };
+		assert_eq!(choices[0].gate_indirect, 0x01);
+		assert_eq!(choices[0].gate_value, 0x0000);
+		assert_eq!(choices[0].payload_kind, 0x03);
+		assert_eq!(choices[0].payload.len(), 5);
+		assert_eq!(choices[0].size(), 14, "2 + 1 + 3 + 1 + the payload's 7 bytes");
+
+		// The same record with its payload cut off, and one cut off inside the gate, are reported and
+		// dropped rather than read past the end of the script.
+		assert!(make_opcode(&complete[..10], 0).is_none());
+		assert!(make_opcode(&complete[..8], 0).is_none());
 	}
 }
