@@ -1,5 +1,9 @@
-/target
-/unpacked_arcs*
-/extracted_arcs*
+target
+unpacked_arcs*
+extracted_arcs*
 **/*.arc
 **/*.c
+llm_work/
+target/
+validation/
+verification/
