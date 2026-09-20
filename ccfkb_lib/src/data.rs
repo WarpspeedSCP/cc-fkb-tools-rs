@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use std::collections::BTreeMap;
 use crate::opcodes::{lookup_spec, make_opcode, Script};
 use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress, lz77_compress};
@@ -208,8 +209,12 @@ pub struct ArcContents<'a> {
 	pub data: Vec<&'a[u8]>,
 }
 
-#[must_use]
-pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bool) -> ArcContents<'a> {
+/// Splits an arc into its descriptors and file contents, extracting any WIPF side effects into
+/// `out_folder`.
+///
+/// Fails when the arc declares no file descriptors, in which case there is no first offset to start
+/// walking from.
+pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bool) -> anyhow::Result<ArcContents<'a>> {
 	let n_ext_descriptors = transmute_to_u32(0, input);
 
 	let mut ext_descriptors = vec![];
@@ -266,7 +271,10 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 	}
 
 	let mut contents = vec![];
-	let first_offset = files.first().unwrap().offset;
+	let Some(first_file) = files.first() else {
+		bail!("{out_folder}: the arc declares no file descriptors");
+	};
+	let first_offset = first_file.offset;
 	let mut curr_offset = first_offset;
 	let (_, mut input) = input.split_at_mut(first_offset as usize);
 	for (filename, desc) in filenames.iter().zip(&files) {
@@ -298,16 +306,15 @@ pub fn read_arc<'a>(input: &'a mut [u8], out_folder: &Utf8Path, extract_wipf: bo
 		contents.push(&*content);
 	}
 
-	ArcContents {
+	Ok(ArcContents {
 		extensions: ext_descriptors,
 		files,
 		filenames,
 		data: contents,
-	}
+	})
 }
 
-#[must_use]
-pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> Vec<u8> {
+pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> anyhow::Result<Vec<u8>> {
 	let mut output = vec![];
 
 	output.extend((extensions.len() as u32).to_le_bytes());
@@ -335,9 +342,9 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 
 		output.extend(sjis_name);
 		let mut contents = if curr_path.is_dir() {
-			do_pack_wipf(&curr_path).unwrap_or_default()
+			do_pack_wipf(curr_path).with_context(|| format!("packing the WIPF directory {curr_path}"))?
 		} else {
-			std::fs::read(&curr_path).unwrap()
+			std::fs::read(curr_path).with_context(|| format!("reading {curr_path}"))?
 		};
 		if curr_path.file_name().map(|it| it.to_ascii_uppercase().ends_with("WSC")).unwrap_or_default() {
 			rotate_wsc_for_pack(&mut contents)
@@ -354,10 +361,10 @@ pub fn write_arc<T: AsRef<Utf8Path>>(input_files: &[T], extensions: Vec<Extensio
 
 	things_to_append.iter().for_each(|it| output.extend(it));
 
-	output
+	Ok(output)
 }
 
-pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> (Vec<ExtensionDescriptor>, Vec<FileDescriptor>, Vec<Utf8PathBuf>, usize, u32) {
+pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> anyhow::Result<(Vec<ExtensionDescriptor>, Vec<FileDescriptor>, Vec<Utf8PathBuf>, usize, u32)> {
 	let mut grouped: BTreeMap<String, Vec<camino::Utf8PathBuf>> = BTreeMap::new();
 
 	for file in files {
@@ -385,8 +392,14 @@ pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> (Vec<ExtensionDescri
 	for (_, group) in grouped.into_iter() {
 		for file in group.into_iter() {
 			file_descriptors.push(FileDescriptor {
-				name: file.file_stem().unwrap().to_uppercase(),
-				size: std::fs::metadata(&file).unwrap().len().next_multiple_of(4) as u32,
+				name: file
+					.file_stem()
+					.with_context(|| format!("{file} has no file stem"))?
+					.to_uppercase(),
+				size: std::fs::metadata(&file)
+					.with_context(|| format!("reading the metadata of {file}"))?
+					.len()
+					.next_multiple_of(4) as u32,
 				offset: 0,
 			});
 			pack_files.push(file);
@@ -412,7 +425,7 @@ pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> (Vec<ExtensionDescri
 		descriptor.offset = data_offset;
 		data_offset += descriptor.size;
 	}
-	(extension_descriptors, file_descriptors, pack_files, file_data_start, data_offset)
+	Ok((extension_descriptors, file_descriptors, pack_files, file_data_start, data_offset))
 }
 
 /// Direct content entries of an extracted arc directory, sorted.
@@ -437,9 +450,11 @@ pub fn arc_entries(arc_dir: &Utf8Path) -> std::io::Result<Vec<Utf8PathBuf>> {
 }
 
 /// Serializes an arc from `input_files` + descriptors and writes it to `output_path`.
-pub fn pack_arc(output_path: &Utf8Path, input_files: &[Utf8PathBuf], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> std::io::Result<()> {
-	let output = write_arc(input_files, extensions, files);
+pub fn pack_arc(output_path: &Utf8Path, input_files: &[Utf8PathBuf], extensions: Vec<ExtensionDescriptor>, files: Vec<FileDescriptor>) -> anyhow::Result<()> {
+	let output = write_arc(input_files, extensions, files)
+		.with_context(|| format!("packing the arc at {output_path}"))?;
 	std::fs::write(output_path, output)
+		.with_context(|| format!("writing {output_path}"))
 }
 
 fn rotate_wsc_for_unpack(input: &mut [u8]) {
@@ -460,7 +475,12 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 	use nom::IResult;
 	use nom::Parser;
 
-	let mut files_to_pack = walkdir::WalkDir::new(input_dir).contents_first(false).into_iter().skip(1).map(|entry| entry.unwrap().into_path()).collect::<Vec<_>>();
+	let mut files_to_pack = walkdir::WalkDir::new(input_dir)
+		.contents_first(false)
+		.into_iter()
+		.skip(1)
+		.map(|entry| entry.map(|it| it.into_path()).map_err(|err| std::io::Error::other(err.to_string())))
+		.collect::<std::io::Result<Vec<_>>>()?;
 	files_to_pack.sort();
 	let depth = files_to_pack
 		.first()
@@ -480,7 +500,9 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 		.unwrap_or(24);
 	let depth_is_8 = depth == 8;
 
-	let file_name = input_dir.file_name().unwrap();
+	let file_name = input_dir.file_name().ok_or_else(|| {
+		std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{input_dir} has no directory name"))
+	})?;
 	let header = WIPFHeader::new(files_to_pack.len() as u16, depth);
 
 	fn parse_file_name<'a>(file_name: &str, input: &'a str) -> IResult<&'a str, (&'a str, u32, u32, u32)> {
@@ -491,8 +513,18 @@ fn do_pack_wipf(input_dir: &Utf8Path) -> std::io::Result<Vec<u8>> {
 	let mut wipf_contents = vec![];
 
 	for file in files_to_pack {
-		let path = Utf8Path::from_path(&file).unwrap();
-		let (_, (_, _, x, y)) = parse_file_name(file_name, path.file_name().unwrap()).unwrap();
+		let path = Utf8Path::from_path(&file).ok_or_else(|| {
+			std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} is not valid UTF-8", file.display()))
+		})?;
+		let name = path.file_name().ok_or_else(|| {
+			std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path} has no file name"))
+		})?;
+		let (_, (_, _, x, y)) = parse_file_name(file_name, name).map_err(|err| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("{path} does not match the expected \"{file_name}_H-dH+HxH+H.BMP\" name: {err}"),
+			)
+		})?;
 
 		let bmp = std::fs::read(path)?;
 
@@ -649,7 +681,9 @@ fn do_extract_wipf(filename: &str, output_file_path: &Utf8Path, content: &mut [u
 		u32::from(header.depth)
 	);
 
-	safe_create_dir(&output_file_path).expect(&format!("Couldn't create output file for {filename} at {output_file_path}"));
+	safe_create_dir(output_file_path).map_err(|err| {
+		std::io::Error::new(err.kind(), format!("could not create {output_file_path} for {filename}: {err}"))
+	})?;
 
 	let data = &content[size_of_val(header) + size_of_val(entries)..];
 	let mut data_ptr = 0usize;

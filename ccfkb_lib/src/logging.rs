@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context};
 use log::{Level, Metadata, Record};
 use std::env;
 use std::io::Write;
@@ -50,26 +51,33 @@ impl log::Log for SimpleLogger {
 	}
 
 	fn flush(&self) {
+		// `log::Log::flush` cannot report a failure, and panicking here would abort a program that
+		// may already be reporting a failure of its own, so a broken sink goes to stderr instead.
 		for output in self.output_buffers.iter() {
-			match output {
-				LogOutput::None => {}
-				LogOutput::Stdout => {
-					std::io::stdout().flush().expect("Could not flush stdout");
-				}
-				LogOutput::Stderr => {
-					std::io::stderr().flush().expect("Could not flush stderr");
-				}
-				LogOutput::File(output) => {
-					output.lock().expect("Could not lock log file!").flush().expect("Could not flush output file!");
-				}
+			let res = match output {
+				LogOutput::None => Ok(()),
+				LogOutput::Stdout => std::io::stdout().flush(),
+				LogOutput::Stderr => std::io::stderr().flush(),
+				LogOutput::File(output) => output
+					.lock()
+					.map_err(|_err| std::io::Error::other("could not lock the log file"))
+					.and_then(|mut it| it.flush()),
+			};
+
+			if let Err(err) = res {
+				eprintln!("[{}] could not flush the log output: {err}", Level::Error);
 			}
 		}
 	}
 }
 
 impl SimpleLogger {
-	pub fn from_env() -> Box<Self> {
-		let matching_level = log::Level::from_str(&env::var("RUST_LOG").unwrap_or("info".to_owned())).unwrap_or(Level::Info);
+	pub fn from_env() -> anyhow::Result<Box<Self>> {
+		let matching_level = match env::var("RUST_LOG") {
+			Ok(value) => log::Level::from_str(&value)
+				.map_err(|_err| anyhow!("RUST_LOG has unknown log level {value:?}"))?,
+			Err(_) => Level::Info,
+		};
 
 		let log_output_str = env::var("LOG_OUTPUT")
 			.map(|it| it.to_lowercase())
@@ -101,7 +109,8 @@ impl SimpleLogger {
 					// TODO: Log an error here.
 					continue;
 				}
-				let log_level = log::Level::from_str(k).unwrap() as usize;
+				let log_level = log::Level::from_str(k)
+					.map_err(|_err| anyhow!("LOG_OUTPUT has unknown log level {k:?}"))? as usize;
 
 				let configured_log_level = match v {
 					"off" => LogOutput::None,
@@ -109,27 +118,28 @@ impl SimpleLogger {
 					"stdout" => LogOutput::Stdout,
 					_ => {
 						let path = std::path::PathBuf::from(v);
-						let file = std::fs::File::create(path).expect("Failed to open log file!");
+						let file = std::fs::File::create(&path)
+							.with_context(|| format!("could not open the log file {}", path.display()))?;
 						LogOutput::File(Arc::new(Mutex::new(std::io::BufWriter::new(file))))
 					}
 				};
 
-				let _ = std::mem::replace(output_buffers.get_mut(log_level).unwrap(), configured_log_level);
+				output_buffers[log_level] = configured_log_level;
 			}
 		}
 
-		Box::new(SimpleLogger {
+		Ok(Box::new(SimpleLogger {
 			level: matching_level,
 			log_filenames: false,
 			output_buffers
-		})
+		}))
 	}
 }
 
-pub fn init() -> Result<(), &'static str> {
-	let logger = SimpleLogger::from_env();
+pub fn init() -> anyhow::Result<()> {
+	let logger = SimpleLogger::from_env()?;
 	let level_filter = logger.level.to_level_filter();
 	log::set_boxed_logger(logger)
 		.map(|()| log::set_max_level(level_filter))
-		.map_err(|_| "Logger already initialised!")
+		.map_err(|_| anyhow!("logger already initialised"))
 }

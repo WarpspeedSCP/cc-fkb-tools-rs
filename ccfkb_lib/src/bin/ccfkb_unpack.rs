@@ -1,3 +1,5 @@
+use anyhow::{anyhow, Context};
+use camino::Utf8PathBuf;
 use rayon::prelude::*;
 
 use ccfkb_lib::bin_utils::{decode_wsc_file_command, transform_wsc_file_command};
@@ -6,30 +8,39 @@ use ccfkb_lib::util::current_dir;
 use ccfkb_lib::util::safe_create_dir;
 use ccfkb_lib::{log, main_preamble};
 
-fn main() {
-	let top_out_path = current_dir().join("extracted_arcs");
-	safe_create_dir(&top_out_path).unwrap();
+fn main() -> anyhow::Result<()> {
+	let top_out_path = current_dir()?.join("extracted_arcs");
+	safe_create_dir(&top_out_path)
+		.with_context(|| format!("creating {top_out_path}"))?;
 	let files: Vec<_> = main_preamble!(file ".arc").collect();
 
-	for i in files {
-		let dirent = i;
-		let out_folder_base = &top_out_path.join(dirent.file_name().unwrap());
-		let out_yaml_folder = &out_folder_base.with_extension("arc.yaml");
-		let out_script_folder = &out_folder_base.with_extension("arc.script");
+	for dirent in files {
+		let file_name = dirent
+			.file_name()
+			.ok_or_else(|| anyhow!("{dirent} has no file name"))?;
+		let out_folder_base = top_out_path.join(file_name);
+		let out_yaml_folder = out_folder_base.with_extension("arc.yaml");
+		let out_script_folder = out_folder_base.with_extension("arc.script");
 
-		safe_create_dir(&out_folder_base).unwrap();
-		safe_create_dir(&out_yaml_folder).unwrap();
-		safe_create_dir(&out_script_folder).unwrap();
+		safe_create_dir(&out_folder_base)
+			.with_context(|| format!("creating {out_folder_base}"))?;
+		safe_create_dir(&out_yaml_folder)
+			.with_context(|| format!("creating {out_yaml_folder}"))?;
+		safe_create_dir(&out_script_folder)
+			.with_context(|| format!("creating {out_script_folder}"))?;
 
-		let mut file_contents = std::fs::read(&dirent).unwrap();
+		let mut file_contents = std::fs::read(&dirent)
+			.with_context(|| format!("reading {dirent}"))?;
 
+		// Only the decoded contents matter here; the descriptors come from the sidecar YAMLs.
 		let ArcContents { 
-			extensions,
-			files,
 			filenames,
-			data 
-		} = read_arc(&mut file_contents[..], &out_folder_base, true);
+			data,
+			.. 
+		} = read_arc(&mut file_contents[..], &out_folder_base, true)?;
 
+		// Rayon workers cannot unwind into an error, so each item carries its own `Result` and the
+		// first failure is reported once every item has finished.
 		let output_file_paths: Vec<_> = filenames
 			.iter()
 			.zip(&data)
@@ -37,34 +48,57 @@ fn main() {
 			.map(|(filename, content)| {
 				let out_path = out_folder_base.join(filename);
 				if !out_path.is_dir() {
-					std::fs::write(&out_path, content).unwrap();
+					std::fs::write(&out_path, content)
+						.with_context(|| format!("writing {out_path}"))?;
 				}
-				out_path
+				Ok(out_path)
 			})
-			.collect();
+			.collect::<Vec<anyhow::Result<Utf8PathBuf>>>()
+			.into_iter()
+			.collect::<anyhow::Result<Vec<_>>>()?;
 		log::info!("==============================================");
 		log::info!("              Decoding WSC files              ");
 		log::info!("==============================================");
-		let output_file_paths: Vec<_> = output_file_paths.par_iter().filter_map(|file| {
-			if !file.extension().map(|it| it.ends_with("WSC")).unwrap_or_default() {
-				return None;
-			}
-			let out_path = out_yaml_folder.join(file.file_name().unwrap()).with_extension("WSC.yaml");
-			let res = decode_wsc_file_command(&file);
-			std::fs::write(&out_path, res).unwrap();
+		let output_file_paths: Vec<_> = output_file_paths
+			.par_iter()
+			.map(|file| {
+				if !file.extension().map(|it| it.ends_with("WSC")).unwrap_or_default() {
+					return Ok(None);
+				}
+				let file_name = file
+					.file_name()
+					.ok_or_else(|| anyhow!("{file} has no file name"))?;
+				let out_path = out_yaml_folder.join(file_name).with_extension("WSC.yaml");
+				let res = decode_wsc_file_command(file)?;
+				std::fs::write(&out_path, res)
+					.with_context(|| format!("writing {out_path}"))?;
 
-			Some(out_path)
-		}).collect();
+				Ok(Some(out_path))
+			})
+			.collect::<Vec<anyhow::Result<Option<Utf8PathBuf>>>>()
+			.into_iter()
+			.collect::<anyhow::Result<Vec<_>>>()?
+			.into_iter()
+			.flatten()
+			.collect();
 
 		log::info!("==============================================");
 		log::info!("          Transforming YAML files             ");
 		log::info!("==============================================");
 
-		output_file_paths.par_iter().for_each(|file| {
-			let out_path = out_script_folder.join(file.file_name().unwrap()).with_extension("txt");
-			transform_wsc_file_command(&file, &out_path);
-		});
+		output_file_paths
+			.par_iter()
+			.map(|file| {
+				let file_name = file
+					.file_name()
+					.ok_or_else(|| anyhow!("{file} has no file name"))?;
+				let out_path = out_script_folder.join(file_name).with_extension("txt");
+				transform_wsc_file_command(file, &out_path)
+			})
+			.collect::<Vec<anyhow::Result<()>>>()
+			.into_iter()
+			.collect::<anyhow::Result<()>>()?;
 	}
+
+	Ok(())
 }
-
-

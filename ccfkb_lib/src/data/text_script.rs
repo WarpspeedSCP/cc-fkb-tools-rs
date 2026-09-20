@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use crate::opcodes::{Choice, OpField, Opcode, Script, TLString};
 use std::collections::HashMap;
 
@@ -16,7 +17,7 @@ use std::fmt::Formatter;
 const TL_CHOICE_END: Lazy<String> = Lazy::new(|| "---~~~---".to_string());
 const TL_LINE_END: Lazy<String> = Lazy::new(|| "---===---".to_string());
 
-pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
+pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) -> anyhow::Result<()> {
 	let mut addr2opcode: HashMap<usize, &mut Opcode> = HashMap::new();
 	for opcode in script.opcodes.iter_mut() {
 		if ![0x41, 0x42, 0xE0, 0x02].contains(&opcode.opcode) {
@@ -34,7 +35,9 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
 	for line in tl_doc.into_iter() {
 		match line {
 			DocLine::Line(line) => {
-				let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
+				let Some(opcode) = addr2opcode.get_mut(&(line.address as usize)) else {
+					bail!("translation line for 0x{:08X} does not match a text opcode in the script", line.address);
+				};
 
 				if opcode.opcode == 0x41 {
 					match &mut opcode.fields[3] {
@@ -46,7 +49,9 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
 				}
 			}
 			DocLine::Scene(line) => {
-				let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
+				let Some(opcode) = addr2opcode.get_mut(&(line.address as usize)) else {
+					bail!("scene for 0x{:08X} does not match an opcode 0xE0 in the script", line.address);
+				};
 
 				if opcode.opcode == 0xE0 {
 					match &mut opcode.fields[0] {
@@ -58,7 +63,9 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
 				}
 			}
 			DocLine::SpeakerLine(line) => {
-				let opcode = addr2opcode.get_mut(&(line.address as usize)).unwrap();
+				let Some(opcode) = addr2opcode.get_mut(&(line.address as usize)) else {
+					bail!("speaker line for 0x{:08X} does not match an opcode 0x42 in the script", line.address);
+				};
 				if opcode.opcode == 0x42 {
 					match &mut opcode.fields[4] {
 						OpField::String(orig_str) => {
@@ -76,7 +83,9 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
 				}
 			}
 			DocLine::Choices(choice) => {
-				let opcode = addr2opcode.get_mut(&(choice.address as usize)).unwrap();
+				let Some(opcode) = addr2opcode.get_mut(&(choice.address as usize)) else {
+					bail!("choices for 0x{:08X} do not match an opcode 0x02 in the script", choice.address);
+				};
 				if opcode.opcode == 0x02 {
 					match &mut opcode.fields[2] {
 						OpField::Choice(orig_choices) => {
@@ -93,9 +102,11 @@ pub fn tl_reverse_transform_script(script: &mut Script, tl_doc: Vec<DocLine>) {
 			}
 		}
 	}
+
+	Ok(())
 }
 
-pub fn tl_transform_script(input: &Script) -> String {
+pub fn tl_transform_script(input: &Script) -> anyhow::Result<String> {
 	let mut lines = vec![];
 
 	for opcode in input.opcodes.iter() {
@@ -111,8 +122,12 @@ pub fn tl_transform_script(input: &Script) -> String {
 					_ => None,
 				});
 
-				let speaker_tl_string = thing.next().unwrap();
-				let tl_string = thing.next().unwrap();
+				let speaker_tl_string = thing.next().with_context(|| {
+					format!("opcode 0x42 at 0x{address:08X} has no speaker string")
+				})?;
+				let tl_string = thing.next().with_context(|| {
+					format!("opcode 0x42 at 0x{address:08X} has no text string")
+				})?;
 
 				let docline = DocLine::SpeakerLine(SpeakerLine {
 					speaker_translation: speaker_tl_string.clone(),
@@ -151,7 +166,7 @@ pub fn tl_transform_script(input: &Script) -> String {
 						OpField::String(it) => Some(it),
 						_ => None,
 					})
-					.unwrap();
+					.with_context(|| format!("opcode 0x41 at 0x{address:08X} has no string field"))?;
 
 				let docline = DocLine::Line(Line {
 					translation: tl_string.clone(),
@@ -168,7 +183,7 @@ pub fn tl_transform_script(input: &Script) -> String {
 						OpField::Choice(it) => Some(it),
 						_ => None,
 					})
-					.unwrap();
+					.with_context(|| format!("opcode 0x02 at 0x{address:08X} has no choice list"))?;
 
 				let docline = DocLine::Choices(ChoiceLine {
 					address: address as u32,
@@ -185,7 +200,7 @@ pub fn tl_transform_script(input: &Script) -> String {
 		lines.push("\n\n\n".to_string());
 	}
 
-	lines.join("")
+	Ok(lines.join(""))
 }
 
 pub fn is_digit_a(c: char) -> bool {

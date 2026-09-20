@@ -1,3 +1,5 @@
+use anyhow::{anyhow, Context};
+
 pub fn transmute_to_array<const SIZE: usize>(address: usize, input: &[u8]) -> [u8; SIZE] {
 	input[address..address + SIZE].try_into().unwrap()
 }
@@ -10,8 +12,10 @@ pub fn transmute_to_u16(address: usize, input: &[u8]) -> u16 {
 	u16::from_le_bytes(transmute_to_array(address, input))
 }
 
-pub fn current_dir() -> camino::Utf8PathBuf {
-	camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap()
+pub fn current_dir() -> anyhow::Result<camino::Utf8PathBuf> {
+	let cwd = std::env::current_dir().context("could not read the current directory")?;
+	camino::Utf8PathBuf::from_path_buf(cwd)
+		.map_err(|path| anyhow!("the current directory {} is not valid UTF-8", path.display()))
 }
 
 /// Which kind of filesystem entry a [`crate::main_preamble!`] search accepts.
@@ -121,13 +125,10 @@ fn tokens(unicode: &str) -> Vec<String> {
 		.collect::<Vec<_>>();
 	let mut char_idx = 0usize;
 	loop {
-		let chr = chrs.get(char_idx);
-		if chr.is_none() {
+		let Some(&chr) = chrs.get(char_idx) else {
 			result.push(std::mem::take(&mut curr_str));
 			break;
-		}
-
-		let chr = *chr.unwrap();
+		};
 		char_idx += 1;
 
 		if chr.is_whitespace() {

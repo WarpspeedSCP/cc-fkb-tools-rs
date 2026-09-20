@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use crate::util::{encode_sjis, get_sjis_bytes, transmute_to_u16};
 use itertools::Itertools;
 use serde::Serializer;
@@ -44,19 +45,6 @@ pub enum OpField {
 }
 
 impl OpField {
-	fn as_byte(&self) -> Option<u8> {
-		match &self {
-			OpField::Byte(b) => Some(*b),
-			_ => None,
-		}
-	}
-	fn as_word(&self) -> Option<u16> {
-		match &self {
-			OpField::Word(w) => Some(*w),
-			_ => None,
-		}
-	}
-
 	fn as_dword(&self) -> Option<u32> {
 		match &self {
 			OpField::DWord(d) => Some(*d),
@@ -215,7 +203,11 @@ pub struct Script {
 }
 
 impl Script {
-	pub fn binary_serialise(mut self) -> Vec<u8> {
+	/// Serialises the script, resolving every jump target to a byte offset.
+	///
+	/// Fails when a jump operand is not a dword or points at an address that holds no instruction:
+	/// either means the file was edited into a state the game could not run.
+	pub fn binary_serialise(mut self) -> anyhow::Result<Vec<u8>> {
 		let mut buf = vec![];
 
 		let mut jump_map: HashMap<u32, usize> = HashMap::new();
@@ -231,9 +223,17 @@ impl Script {
 		for opcode in self.opcodes.iter_mut() {
 			match opcode.opcode {
 				0x06 => {
+					let target = opcode.fields[0].as_dword().ok_or_else(|| anyhow!(
+						"direct jump at 0x{:08X} does not hold a dword target",
+						opcode.address
+					))? as usize;
 					let (idx, orig_op) = orig_opcodes
-						.iter().find_position(|it| it.address == (opcode.fields[0].as_dword().unwrap() as usize))
-						.unwrap();
+						.iter()
+						.find_position(|it| it.address == target)
+						.ok_or_else(|| anyhow!(
+							"direct jump at 0x{:08X} targets 0x{target:08X}, which is not an instruction in this file",
+							opcode.address
+						))?;
 					log::debug!(
             "Direct jump opcode at 0x{:08X} (actual 0x{:08X}) jumps to: 0x{:04X}",
             opcode.address,
@@ -243,8 +243,17 @@ impl Script {
 					jump_map.insert(opcode.address as u32, idx);
 				}
 				0x01 => {
-					let (idx, orig_op) = orig_opcodes.iter().find_position(|it| it.address == (opcode.address + 11 + opcode.fields[3].as_dword().unwrap() as usize))
-						.unwrap();
+					let target = opcode.address + 11 + opcode.fields[3].as_dword().ok_or_else(|| anyhow!(
+						"conditional jump at 0x{:08X} does not hold a dword offset",
+						opcode.address
+					))? as usize;
+					let (idx, orig_op) = orig_opcodes
+						.iter()
+						.find_position(|it| it.address == target)
+						.ok_or_else(|| anyhow!(
+							"conditional jump at 0x{:08X} targets 0x{target:08X}, which is not an instruction in this file",
+							opcode.address
+						))?;
 
 					jump_map.insert(opcode.address as u32, idx);
 					log::debug!(
@@ -269,7 +278,7 @@ impl Script {
 
 		buf.extend(&self.trailer);
 
-		buf
+		Ok(buf)
 	}
 }
 
@@ -282,12 +291,13 @@ fn adjust_single_opcode(
 	match opcode.opcode {
 		0x06 => {
 			let tbl_entry = jump_table[&(opcode.address as u32)];
-			opcode.fields[0] = OpField::DWord(opcodes[tbl_entry].actual_address as u32);
+			let target_address = opcodes[tbl_entry].actual_address as u32;
+			opcode.fields[0] = OpField::DWord(target_address);
 			log::debug!(
         "Adjusting direct jump Opcode at 0x{:08X} (actual {:08X}) to jump to: {:08X}",
         opcode.address,
         opcode.actual_address,
-        opcode.fields[0].as_word().unwrap(),
+        target_address,
       );
 			opcode
 		}
@@ -999,7 +1009,7 @@ mod spec_test {
 
 		let back: Script = serde_yml::from_str(&yaml).unwrap();
 		assert_eq!(back.opcode_table, script.opcode_table);
-		assert_eq!(back.binary_serialise(), script.binary_serialise());
+		assert_eq!(back.binary_serialise().unwrap(), script.binary_serialise().unwrap());
 	}
 
 	#[test]
