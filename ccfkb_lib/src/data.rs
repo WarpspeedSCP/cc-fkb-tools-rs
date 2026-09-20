@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use crate::opcodes::{make_opcode, Script};
+use crate::opcodes::{lookup_spec, make_opcode, Script};
 use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress, lz77_compress};
 use camino::{Utf8Path as Utf8Path, Utf8PathBuf};
 use serde_derive::{Deserialize, Serialize};
@@ -822,7 +822,18 @@ pub fn decode_wsc(input: &[u8]) -> Script {
 		input[ptr..].to_vec()
 	};
 
+	// Global opcode manifest: one entry per opcode this file uses, ascending.
+	let mut used = std::collections::BTreeSet::new();
+	for op in &opcodes {
+		used.insert(op.opcode);
+	}
+	let opcode_table = used
+		.into_iter()
+		.filter_map(|byte| lookup_spec(byte).map(|spec| spec.to_manifest()))
+		.collect();
+
 	let out = Script {
+		opcode_table,
 		opcodes,
 		trailer: rest,
 	};
@@ -860,6 +871,12 @@ mod test {
 		for m in missing.iter().take(10) { println!("    MISSING {m}"); }
 	}
 
+	/// WIPF fixtures live in the repository root while `cargo test` runs with the CWD set to the
+	/// crate directory, so fixture paths must be anchored to `CARGO_MANIFEST_DIR`.
+	fn repo_fixture(rel: &str) -> Utf8PathBuf {
+		Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(rel)
+	}
+
 	fn roundtrip_dir(input_dir: &Utf8Path, filename: &str, out_dir: &Utf8Path) {
 		let _ = std::fs::remove_dir_all(out_dir);
 		std::fs::create_dir_all(out_dir.parent().unwrap()).unwrap();
@@ -893,9 +910,8 @@ mod test {
 
 	#[test]
 	fn lz77_matches_original_entries() {
-		let root = ".";
 		let file = "BGM_P1G.WIP";
-		let content = std::fs::read(format!("{root}/{file}")).unwrap();
+		let content = std::fs::read(repo_fixture(file)).unwrap();
 		let header = WIPFHeader::from_ref(&content);
 		let entries = WIPFENTRY::from_ref_as_slice(&content[std::mem::size_of_val(header)..], header.n_entries as usize);
 		let data_start = std::mem::size_of_val(header) + std::mem::size_of_val(entries);
@@ -925,14 +941,13 @@ mod test {
 
 	#[test]
 	fn wipf_roundtrip_8bit() {
-		let input = Utf8PathBuf::from("./extracted_arcs/Chip.arc/EVCC0020A.MOS");
+		let input = repo_fixture("extracted_arcs/Chip.arc/EVCC0020A.MOS");
 		roundtrip_dir(&input, "EVCC0020A.MOS", &Utf8PathBuf::from("/tmp/wipf_rt_8"));
 	}
 
 	#[test]
 	fn wipf_roundtrip_24bit() {
-		let root = ".";
-		let orig = std::fs::read(format!("{root}/BGM_P1G.WIP")).unwrap();
+		let orig = std::fs::read(repo_fixture("BGM_P1G.WIP")).unwrap();
 		let extract_dir = Utf8PathBuf::from("/tmp/wipf_rt_24/BGM_P1G.WIP");
 		let _ = std::fs::remove_dir_all(&extract_dir);
 		std::fs::create_dir_all(extract_dir.parent().unwrap()).unwrap();

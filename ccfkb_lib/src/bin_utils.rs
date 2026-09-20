@@ -44,6 +44,10 @@ pub fn encode_wsc_file_command(yaml_name_path: &Utf8Path, out_dir_path: &Utf8Pat
 
 	let script: Script = serde_yml::from_str(&input).unwrap();
 
+	if let Err(err) = crate::opcodes::validate_opcode_table(&script) {
+		panic!("Refusing to encode {yaml_name_path}: {err}");
+	}
+
 	let out = script.binary_serialise();
 
 	std::fs::write(out_dir_path.join(yaml_name_path.with_extension("").file_name().unwrap()), out).unwrap();
