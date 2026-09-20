@@ -413,6 +413,12 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
                 ptr += 4;
             }
         };
+        (p $num: expr) => {
+            {
+	            fields.push(OpField::Padding(input[ptr..(ptr + $num)].to_vec()));
+                ptr += $num;
+            }
+        };
         (p) => {
             {
 				if let Some(OpField::Padding(contents)) = fields.last_mut() {
@@ -459,6 +465,11 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
         };
         (p, $($tail:tt)*) => {
                 expand_opcode_component!(p);
+
+                expand_opcode_inner!($($tail)*)
+        };
+        (p $num: expr, $($tail:tt)*) => {
+                expand_opcode_component!(p $num);
 
                 expand_opcode_inner!($($tail)*)
         };
@@ -509,6 +520,13 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
     		name = $name;
 
 	        expand_opcode_component!(p);
+
+            expand_opcode_inner!($($tail)*)
+        };
+        ($name: expr, p $num: expr, $($tail:tt)*) => {
+    		name = $name;
+
+	        expand_opcode_component!(p $num);
 
             expand_opcode_inner!($($tail)*)
         };
@@ -608,7 +626,7 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 		0xA5 => { expand_opcode!("positional_sfx_stop", b, p,); } 
 		0xA6 => { expand_opcode!("stop_movie", p,); } 
 		0xA7 => { expand_opcode!("crosshair_cursor", p,); } 
-		0xA8 => { expand_opcode!("movie_parameters", b, b, b, p, p, p, p, w, w, w, w, p,); } 
+		0xA8 => { expand_opcode!("movie_parameters", b, b, b, p 4, w, w, w, w, p,); }
 		0xA9 => { expand_opcode!("stop_video", p,); } 
 		0xAA => { expand_opcode!("numbered_cursor", b, b, p,); } 
 		0xAB => { expand_opcode!("pointer_position_snapshot", p,); } 
@@ -617,9 +635,9 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 		0xAE => { expand_opcode!("single_call", p,); } 
 		0xB1 => { expand_opcode!("background_center", w, w, p,); } 
 		0xB2 => { expand_opcode!("load_effect_file", b, p, s,); } 
-		0xB3 => { expand_opcode!("stop_effect", p, p,); } 
+		0xB3 => { expand_opcode!("stop_effect", p 2,); }
 		0xB4 => { expand_opcode!("effect_parameters", p, p, w, w, d, b, p,); } 
-		0xB5 => { expand_opcode!("effect_frame_step", b, b, p, p, p, p, p,); } 
+		0xB5 => { expand_opcode!("effect_frame_step", b, b, p 5,); }
 		0xB6 => { expand_opcode!("append_textbox_text", w, s,); } 
 		0xB7 => { expand_opcode!("load_slot_image", b, w, w, s,); } 
 		0xB8 => { expand_opcode!("slot_image_show_hide", b, b, p,); } 
@@ -635,7 +653,7 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 		0xE3 => { expand_opcode!("implicit_resource_op_gated", p,); } 
 		0xE4 => { expand_opcode!("textbox_mode", b, p,); } 
 		0xE5 => { expand_opcode!("end_textbox_sequence", p,); } 
-		0xE6 => { expand_opcode!("nop", p, p,); } 
+		0xE6 => { expand_opcode!("nop", p 2,); }
 		0xE7 => { expand_opcode!("mark_table_entry", w, p,); } 
 		0xE8 => { expand_opcode!("filename_op", s,); } 
 		0xE9 => { expand_opcode!("filename_op_no_string", p,); } 
