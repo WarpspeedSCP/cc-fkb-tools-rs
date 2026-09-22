@@ -98,7 +98,7 @@ fn reencode_from_assembly(
 			let stale = apply_doclines(&mut doc, &docline_file)?;
 			if stale > 0 {
 				log::info!(
-					"{docline_file}: {stale} address tag(s) name an older layout; paired by kind and raw text"
+					"{docline_file}: {stale} address tag(s) have layout mismatches. they will be matched by position and original text."
 				);
 			}
 		}
