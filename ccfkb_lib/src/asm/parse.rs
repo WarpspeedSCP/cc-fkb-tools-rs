@@ -34,9 +34,9 @@ use crate::opcodes::{
 use super::grammar::{self, AsmError, DecodedFlag, JumpTarget, LineShape};
 use super::print::{CONST_MAGIC, MAGIC};
 use super::{
-	escape_string, finish_manifest, is_jump_field, jump_field, operand_labels, AsmDocument, AsmItem,
-	AsmOperand, AsmRecord, Comment, CommentAnchor, Constant, ConstantTable, ConstantValue,
-	Diagnostic, Include, Severity, Source, SourceKind,
+	escape_string, is_jump_field, jump_field, operand_labels, AsmDocument, AsmItem, AsmOperand,
+	AsmRecord, Comment, CommentAnchor, Constant, ConstantTable, ConstantValue, Diagnostic, Include,
+	Severity, Source, SourceKind,
 };
 
 /// A jump operand whose value can only be filled once every instruction address is known.
@@ -206,7 +206,7 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 	loader.load_script(text, path);
 	let constants = std::mem::take(&mut loader.constants);
 	let mut out = AsmDocument {
-		script: Script { opcode_table: vec![], opcodes: vec![], trailer: vec![] },
+		script: Script { opcodes: vec![], trailer: vec![] },
 		items: vec![],
 		labels: BTreeMap::new(),
 		comments: vec![],
@@ -441,7 +441,7 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 							line,
 							1,
 							format!(
-								"\"yields\" annotation on {mnemonic} (0x{:02X}), whose opcode_table row does not yield",
+								"\"yields\" annotation on {mnemonic} (0x{:02X}), whose table row does not yield",
 								spec.opcode
 							),
 						));
@@ -564,7 +564,6 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 	// A constants file's diagnostics stay together and follow the script's, which is the order
 	// `render_diagnostics` prints them in.
 	out.diagnostics.sort_by_key(|it| (it.source, it.line, it.column));
-	finish_manifest(&mut out.script);
 	out
 }
 

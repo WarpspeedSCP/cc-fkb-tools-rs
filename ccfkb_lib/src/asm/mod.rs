@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 
-use crate::opcodes::{manifest_for, Script};
+use crate::opcodes::Script;
 
 pub mod parse;
 pub mod print;
@@ -356,9 +356,9 @@ impl AsmDocument {
 	}
 
 	/// The script to encode: `Err` (the first error, rendered with its position) when the file has an
-	/// error, else the parsed script. The manifest, every operand and every `translation` annotation
-	/// are already in place — see `parse::parse_document`. Comments are not part of `Script` and are
-	/// dropped here; `print_document` is what preserves them.
+	/// error, else the parsed script. Every operand and every `translation` annotation are already in
+	/// place — see `parse::parse_document`. Comments are not part of `Script` and are dropped here;
+	/// `print_document` is what preserves them.
 	///
 	/// A diagnostic from a constants file names that file; the script's own keep the bare
 	/// `{line}:{column}:` position the bins render with the path they were given.
@@ -436,12 +436,6 @@ pub(crate) fn escape_string(input: &str) -> String {
 	out
 }
 
-/// Fills `script.opcode_table` from the opcodes it holds. Kept here so the parser and the tests
-/// agree on the one way a manifest is produced.
-pub(crate) fn finish_manifest(script: &mut Script) {
-	script.opcode_table = manifest_for(&script.opcodes);
-}
-
 /// True when the field is the jump destination of its opcode (`0x06` `target`, `0x01` `offset`).
 pub(crate) fn is_jump_field(opcode: u8, index: usize) -> bool {
 	matches!((opcode, index), (0x06, 0) | (0x01, 3))
@@ -496,7 +490,7 @@ mod test {
 				.expect("fixture has a conditional jump");
 			opcodes[at].fields[3] = OpField::DWord(jump_target(&opcodes[at], target));
 		}
-		Script { opcode_table: vec![], opcodes, trailer }
+		Script { opcodes, trailer }
 	}
 
 	fn jump_target(opcode: &Opcode, destination: usize) -> u32 {
@@ -1007,7 +1001,6 @@ end_of_script\n\n#trailer [ ]\n",
 		let (_dir, path) = scratch(&[("engine.inc", ENGINE_INC)]);
 		let table = crate::asm::parse::load_constants(Utf8Path::new(&path)).expect("loading").0;
 		let script = Script {
-			opcode_table: vec![],
 			opcodes: vec![
 				Opcode {
 					opcode: 0x8C,

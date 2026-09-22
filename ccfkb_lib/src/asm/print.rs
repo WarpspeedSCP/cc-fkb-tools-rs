@@ -2,12 +2,11 @@
 //! is normative in `assembly/README.md`.
 //!
 //! `print → parse → print` is textually identical and `script → asm → script` preserves `opcodes`
-//! and `trailer`: the manifest is rebuilt by `manifest_for` on parse, `# addr` is derived from
-//! `Opcode::size()`, and a string's `raw` text is what the operand prints (a `translation`, when
-//! present, is emitted as its own annotation, so the bytes still come from the model). A choice
-//! record prints its gate and its payload, the payload opcode named and valued by its own row of the
-//! table — and a token the author wrote (`arg1: SLOT_MAIN`, a payload's `value`) is re-emitted as it
-//! stands, exactly as an instruction operand's is.
+//! and `trailer`: `# addr` is derived from `Opcode::size()`, and a string's `raw` text is what the
+//! operand prints (a `translation`, when present, is emitted as its own annotation, so the bytes
+//! still come from the model). A choice record prints its gate and its payload, the payload opcode
+//! named and valued by its own row of the table — and a token the author wrote (`arg1: SLOT_MAIN`, a
+//! payload's `value`) is re-emitted as it stands, exactly as an instruction operand's is.
 //!
 //! Beside a constants table, the same emitter names values instead of spelling them:
 //! [`print_script_with_constants`] is what `ccfkb_disassemble` uses when it is given a `.inc` file,
@@ -220,7 +219,7 @@ fn comment_line(text: &str) -> String {
 }
 
 /// The address of every instruction, accumulated from the first one by `Opcode::size()` — the same
-/// numbering the YAML `address:` field and the `.txt` sidecar tags use.
+/// numbering the `.txt` sidecar tags use.
 fn derive_addresses(script: &Script) -> Vec<usize> {
 	let mut addresses = Vec::with_capacity(script.opcodes.len());
 	let mut address = script.opcodes.first().map(|it| it.address).unwrap_or_default();
