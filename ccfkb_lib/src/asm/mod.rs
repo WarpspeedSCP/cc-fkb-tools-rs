@@ -1381,4 +1381,51 @@ textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"　
 			"applying an unedited sidecar rewrites nothing"
 		);
 	}
+
+	/// A translation changes an instruction's size, which moves every address after it: the jump
+	/// destinations the file spells as addresses have to be re-derived, or the rewritten file names
+	/// nothing and `ccfkb_assemble` refuses it.
+	#[test]
+	fn a_translation_moves_the_addresses_and_the_jumps_follow() {
+		let fixture = "# cc-fkb asm 1\n# script T.WSC\n\n\
+textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"short\"\n\
+\n\
+conditional_branch branch_type: 0x19, arg1: 0x0001, arg2: 0x0000, offset: L_00000016, pad: 0x00\n\
+\n\
+return pad: 0x00\n\
+\n#trailer [ ]\n";
+		let mut doc = parse_document(fixture, Utf8Path::new(NAME));
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+		let before = doc.items[2].address;
+		assert_eq!(before, 0x16, "the fixture's own numbering");
+
+		// The sort of edit `ccfkb_untransform` carries over from the sidecar.
+		let sidecar = tl_transform_script(&doc.script).expect("transforming");
+		let edited = sidecar.replace(
+			"[translation]: \n",
+			"[translation]: A much longer line of text than the original\n",
+		);
+		let (_, doclines) = parse_doclines(&edited).expect("reading the sidecar");
+		tl_reverse_transform_script(&mut doc.script, doclines).expect("applying the sidecar");
+
+		let printed = print_document(&doc, NAME).expect("printing");
+		// What the printer wrote is a file the assembler accepts: the destination moved with the
+		// instruction, so the branch still lands on it.
+		let again = parse_document(&printed, Utf8Path::new(NAME));
+		assert!(again.diagnostics.is_empty(), "{:#?}", again.diagnostics);
+		let moved = again.items[2].address;
+		assert!(moved > before, "the longer text pushed the last instruction down:\n{printed}");
+		assert!(
+			printed.contains(&format!("offset: L_{moved:08X}")),
+			"the jump names where its target now is:\n{printed}"
+		);
+		assert!(
+			!printed.contains("offset: L_00000016"),
+			"the stale destination is gone:\n{printed}"
+		);
+		assert_eq!(
+			again.clone().into_script().unwrap().binary_serialise().unwrap(),
+			doc.clone().into_script().unwrap().binary_serialise().unwrap()
+		);
+	}
 }

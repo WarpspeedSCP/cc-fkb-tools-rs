@@ -15,16 +15,14 @@
 //! includes of a constants file are *not* re-emitted into the script — a nested path is relative to
 //! its own file — only the script's own `#include` lines are.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::bail;
 
 use crate::opcodes::{lookup_spec, Choice, Code, OpField, OpcodeSpecStatic, Script};
 
-use super::{
-	escape_string, is_jump_field, jump_destination, operand_labels, AsmDocument, AsmItem, AsmRecord,
-	Comment, CommentAnchor, ConstantTable,
-};
+use super::grammar::{self, JumpTarget};
+use super::{escape_string, is_jump_field, jump_destination, operand_labels, AsmDocument, AsmItem, AsmRecord, Comment, CommentAnchor, ConstantTable, AsmOperand};
 
 /// Line 1 of every script, the only accepted version.
 pub const MAGIC: &str = "# cc-fkb asm 1";
@@ -97,6 +95,15 @@ pub fn print_document(doc: &AsmDocument, script_name: &str) -> anyhow::Result<St
 fn render(script: &Script, script_name: &str, shape: Shape<'_>) -> anyhow::Result<String> {
 	let addresses = derive_addresses(script);
 	let destinations = jump_destinations(script, &addresses);
+	// Where each instruction sat in the text against where its sizes put it now. The two differ only
+	// when a caller changed the script's sizes (`ccfkb_untransform`, whose translations do), and a
+	// jump destination the text spells as an address has to move with them.
+	let moved: BTreeMap<usize, usize> = script
+		.opcodes
+		.iter()
+		.map(|it| it.address)
+		.zip(addresses.iter().copied())
+		.collect();
 
 	let mut blocks: Vec<Vec<String>> = Vec::with_capacity(script.opcodes.len());
 	for (index, opcode) in script.opcodes.iter().enumerate() {
@@ -122,6 +129,7 @@ fn render(script: &Script, script_name: &str, shape: Shape<'_>) -> anyhow::Resul
 			spec,
 			opcode,
 			address,
+			&moved,
 			destinations.contains(&address),
 			keep_addr,
 			item,
@@ -263,6 +271,7 @@ fn print_instruction(
 	spec: &OpcodeSpecStatic,
 	opcode: &crate::opcodes::Opcode,
 	address: usize,
+	moved: &BTreeMap<usize, usize>,
 	is_destination: bool,
 	with_addr: bool,
 	item: Option<&AsmItem>,
@@ -307,6 +316,7 @@ fn print_instruction(
 				choice_records.push(print_choice(
 					choice,
 					address,
+					moved,
 					item.and_then(|it| it.records.get(index)),
 					constants,
 				)?);
@@ -314,11 +324,22 @@ fn print_instruction(
 			continue;
 		}
 		// A token the author wrote is re-emitted as it stands — a name or a literal, either case, both
-		// spell the same bytes — so `fmt` never rewrites what it was given.
-		let printed = match item.and_then(|it| it.operands.get(index)) {
-			Some(operand) => operand.text.clone(),
-			None => print_value(spec, index, code, field, address, constants)?,
-		};
+		// spell the same bytes — so `fmt` never rewrites what it was given. A jump destination spelled
+		// as an address cannot always stand: see `keep_token` and `jump_destination_in_text`.
+		let destination = jump_destination_in_text(spec.opcode, index, opcode.address, field, moved);
+		let token = item
+			.and_then(|it| it.operands.get(index))
+			.filter(|it| keep_token(it.text.as_str(), destination, index, spec.opcode));
+		let printed = print_token(
+			address,
+			constants,
+			spec,
+			index,
+			code,
+			field,
+			destination,
+			token
+		)?;
 		operands.push(format!("{label}: {printed}"));
 	}
 	if operands.is_empty() {
@@ -340,6 +361,7 @@ fn print_instruction(
 fn print_choice(
 	choice: &Choice,
 	address: usize,
+	moved: &BTreeMap<usize, usize>,
 	record: Option<&AsmRecord>,
 	constants: Option<&ConstantTable>,
 ) -> anyhow::Result<String> {
@@ -385,10 +407,23 @@ fn print_choice(
 			let labels = operand_labels(spec.operands);
 			let mut printed = Vec::with_capacity(spec.layout.len());
 			for (index, (code, field)) in spec.layout.iter().zip(choice.payload.iter()).enumerate() {
-				let value = match record.and_then(|it| it.payload.get(index)) {
-					Some(operand) => operand.text.clone(),
-					None => print_value(spec, index, code, field, address, constants)?,
-				};
+				// A payload's own jump destination is an absolute address like an instruction's, and
+				// the record has no address of its own to measure a relative one from.
+				let destination =
+					jump_destination_in_text(spec.opcode, index, address, field, moved);
+				let token = record
+					.and_then(|it| it.payload.get(index))
+					.filter(|it| keep_token(it.text.as_str(), destination, index, spec.opcode));
+				let value = print_token(
+					address,
+					constants,
+					spec,
+					index,
+					code,
+					field,
+					destination,
+					token
+				)?;
 				printed.push(format!("{}: {value}", labels[index]));
 			}
 			line.push_str(&format!("{} {}", spec.name, printed.join(", ")));
@@ -409,11 +444,24 @@ fn print_choice(
 	Ok(line)
 }
 
-/// One operand, canonically: a literal for every number, and a `L_<hex>` label for a jump
-/// destination. With a `constants` table in scope, a value one of its definitions declares prints as
-/// that name instead — a 1-byte operand prefers a constant of that width — and a jump destination
-/// prefers an engine address constant over the format's own label. Padding bytes and choice trailers
-/// are structural and are never named.
+fn print_token(address: usize, constants: Option<&ConstantTable>, spec: &OpcodeSpecStatic, index: usize, code: &Code, field: &OpField, destination: Option<usize>, token: Option<&AsmOperand>) -> anyhow::Result<String> {
+	let value = match token {
+		Some(operand) => operand.text.clone(),
+		None => match destination {
+			Some(destination) => print_destination(destination, constants),
+			None => print_value(spec, index, code, field, address, constants)?,
+		},
+	};
+	Ok(value)
+}
+
+/// One operand, canonically: a literal for every number. With a `constants` table in scope, a value
+/// one of its definitions declares prints as that name instead — a 1-byte operand prefers a constant
+/// of that width. Padding bytes and choice trailers are structural and are never named.
+///
+/// A jump destination never reaches this: its caller resolved it through
+/// [`jump_destination_in_text`] and printed it with [`print_destination`], because the place it names
+/// moves when a caller changes the script's sizes.
 fn print_value(
 	spec: &OpcodeSpecStatic,
 	index: usize,
@@ -436,19 +484,8 @@ fn print_value(
 		(Code::Word, OpField::Word(value)) => {
 			named_number(constants, *value as u64, 2, label).unwrap_or_else(|| format!("0x{value:04X}"))
 		}
-		(Code::DWord, OpField::DWord(value)) => {
-			if is_jump_field(spec.opcode, index) {
-				let destination = jump_destination(spec.opcode, address, *value)
-					.ok_or_else(|| anyhow::anyhow!("0x{:02X} is not a jump opcode", spec.opcode))?;
-				constants
-					.and_then(|it| it.name_for_address(destination))
-					.map(|it| it.to_owned())
-					.unwrap_or_else(|| format!("L_{destination:08X}"))
-			} else {
-				named_number(constants, *value as u64, 4, label)
-					.unwrap_or_else(|| format!("0x{value:08X}"))
-			}
-		}
+		(Code::DWord, OpField::DWord(value)) => named_number(constants, *value as u64, 4, label)
+			.unwrap_or_else(|| format!("0x{value:08X}")),
 		(Code::Str, OpField::String(value)) => constants
 			.and_then(|it| it.name_for_text(&value.raw))
 			.map(|it| it.to_owned())
@@ -531,4 +568,51 @@ fn dword_of(field: &OpField) -> Option<u32> {
 		OpField::DWord(value) => Some(*value),
 		_ => None,
 	}
+}
+
+/// Whether an author's operand token can be re-emitted as it stands.
+///
+/// Every token can, except a jump destination spelled as an address: `L_<hex>` and `0x…` name a
+/// *place*, and the printer may have moved it — `ccfkb_untransform` changes an instruction's size
+/// when it carries a translation over, and every later address moves with it. A *name* is resolved
+/// from its `# label` line, which moves with the instruction, so it always stands.
+fn keep_token(token: &str, destination: Option<usize>, index: usize, opcode: u8) -> bool {
+	if !is_jump_field(opcode, index) {
+		return true;
+	}
+	match grammar::jump_target(token) {
+		Some(JumpTarget::Name(_)) => true,
+		Some(JumpTarget::Address(spelled)) | Some(JumpTarget::LabelAddress(spelled)) => {
+			destination == Some(spelled as usize)
+		}
+		None => false,
+	}
+}
+
+/// The destination a jump field names, in the numbering the printer is about to write: the field
+/// names a place in the numbering the text carries — the address itself for `0x06`, an offset from
+/// the instruction for `0x01` — and `moved` says where that place is now. `None` when the operand is
+/// no jump destination at all.
+fn jump_destination_in_text(
+	opcode: u8,
+	index: usize,
+	text_address: usize,
+	field: &OpField,
+	moved: &BTreeMap<usize, usize>,
+) -> Option<usize> {
+	if !is_jump_field(opcode, index) {
+		return None;
+	}
+	let destination =
+		dword_of(field).and_then(|it| jump_destination(opcode, text_address, it))?;
+	Some(moved.get(&destination).copied().unwrap_or(destination))
+}
+
+/// A destination as the text spells one: the name of an address constant that declares it, or the
+/// format's own `L_<hex>` label.
+fn print_destination(destination: usize, constants: Option<&ConstantTable>) -> String {
+	constants
+		.and_then(|it| it.name_for_address(destination))
+		.map(|it| it.to_owned())
+		.unwrap_or_else(|| format!("L_{destination:08X}"))
 }

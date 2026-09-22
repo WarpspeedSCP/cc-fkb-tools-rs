@@ -2,12 +2,15 @@ use anyhow::{anyhow, Context};
 use camino::Utf8PathBuf;
 use rayon::prelude::*;
 
-use ccfkb_lib::bin_utils::{decode_wsc_file_command, transform_wsc_file_command};
+use ccfkb_lib::bin_utils::{disassemble_wsc_file_command, transform_asm_file_command};
 use ccfkb_lib::data::{read_arc, ArcContents};
 use ccfkb_lib::util::current_dir;
 use ccfkb_lib::util::safe_create_dir;
 use ccfkb_lib::{log, main_preamble};
 
+/// Unpacks every `.arc` into `<arc>/` (its files), `<arc>.arc.asm/` (each `.WSC` disassembled) and
+/// `<arc>.arc.script/` (the translator's text form of each script), so the three trees describe the
+/// same scripts side by side.
 fn main() -> anyhow::Result<()> {
 	let top_out_path = current_dir()?.join("extracted_arcs");
 	safe_create_dir(&top_out_path)
@@ -19,20 +22,20 @@ fn main() -> anyhow::Result<()> {
 			.file_name()
 			.ok_or_else(|| anyhow!("{dirent} has no file name"))?;
 		let out_folder_base = top_out_path.join(file_name);
-		let out_yaml_folder = out_folder_base.with_extension("arc.yaml");
+		let out_asm_folder = out_folder_base.with_extension("arc.asm");
 		let out_script_folder = out_folder_base.with_extension("arc.script");
 
 		safe_create_dir(&out_folder_base)
 			.with_context(|| format!("creating {out_folder_base}"))?;
-		safe_create_dir(&out_yaml_folder)
-			.with_context(|| format!("creating {out_yaml_folder}"))?;
+		safe_create_dir(&out_asm_folder)
+			.with_context(|| format!("creating {out_asm_folder}"))?;
 		safe_create_dir(&out_script_folder)
 			.with_context(|| format!("creating {out_script_folder}"))?;
 
 		let mut file_contents = std::fs::read(&dirent)
 			.with_context(|| format!("reading {dirent}"))?;
 
-		// Only the decoded contents matter here; the descriptors come from the sidecar YAMLs.
+		// Only the decoded contents matter here; the descriptors come from what is on disk.
 		let ArcContents { 
 			filenames,
 			data,
@@ -68,8 +71,8 @@ fn main() -> anyhow::Result<()> {
 				let file_name = file
 					.file_name()
 					.ok_or_else(|| anyhow!("{file} has no file name"))?;
-				let out_path = out_yaml_folder.join(file_name).with_extension("WSC.yaml");
-				let res = decode_wsc_file_command(file)?;
+				let out_path = out_asm_folder.join(file_name).with_extension("WSC.asm");
+				let res = disassemble_wsc_file_command(file, file_name, None)?;
 				std::fs::write(&out_path, res)
 					.with_context(|| format!("writing {out_path}"))?;
 
@@ -83,7 +86,7 @@ fn main() -> anyhow::Result<()> {
 			.collect();
 
 		log::info!("==============================================");
-		log::info!("          Transforming YAML files             ");
+		log::info!("         Transforming assembly files          ");
 		log::info!("==============================================");
 
 		output_file_paths
@@ -93,7 +96,7 @@ fn main() -> anyhow::Result<()> {
 					.file_name()
 					.ok_or_else(|| anyhow!("{file} has no file name"))?;
 				let out_path = out_script_folder.join(file_name).with_extension("txt");
-				transform_wsc_file_command(file, &out_path)
+				transform_asm_file_command(file, &out_path)
 			})
 			.collect::<Vec<anyhow::Result<()>>>()
 			.into_iter()

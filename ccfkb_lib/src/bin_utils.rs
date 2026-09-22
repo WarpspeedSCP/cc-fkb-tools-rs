@@ -5,20 +5,18 @@ use crate::asm::{
 	parse_document, print_script, print_script_with_constants, AsmDocument, ConstantTable,
 	Diagnostic, Source,
 };
-use crate::data::{decode_wsc, fix_yaml_str};
-use crate::opcodes::{validate_opcode_table, Script};
+use crate::data::decode_wsc;
 use camino::Utf8Path;
 
-pub fn transform_wsc_file_command(wsc_name_path: &Utf8Path, out_file: &Utf8Path) -> anyhow::Result<()> {
-	log::info!("Transforming file {}", wsc_name_path.file_name().unwrap_or_default());
-	let input = std::fs::read_to_string(wsc_name_path)
-		.with_context(|| format!("reading {wsc_name_path}"))?;
-
-	let script: Script = serde_yml::from_str(&input)
-		.with_context(|| format!("parsing {wsc_name_path} as a decoded script"))?;
+/// Reads an `.asm` file and writes the translator's text form of the script it holds to `out_file`:
+/// one `[…]` block per text-bearing opcode, with every raw and translation the model carries, so the
+/// sidecar and the assembly describe the same script.
+pub fn transform_asm_file_command(asm_path: &Utf8Path, out_file: &Utf8Path) -> anyhow::Result<()> {
+	log::info!("Transforming file {}", asm_path.file_name().unwrap_or_default());
+	let script = load_asm_file_command(asm_path)?.into_script()?;
 
 	let out = tl_transform_script(&script)
-		.with_context(|| format!("transforming {wsc_name_path}"))?;
+		.with_context(|| format!("transforming {asm_path}"))?;
 
 	std::fs::write(out_file, out)
 		.with_context(|| format!("writing {out_file}"))?;
@@ -26,63 +24,20 @@ pub fn transform_wsc_file_command(wsc_name_path: &Utf8Path, out_file: &Utf8Path)
 	Ok(())
 }
 
-pub fn decode_wsc_file_command(wsc_name_path: &Utf8Path) -> anyhow::Result<String> {
-	log::info!("Decoding file {}", wsc_name_path.file_name().unwrap_or_default());
-	let input = std::fs::read(wsc_name_path)
-		.with_context(|| format!("reading {wsc_name_path}"))?;
-
-	let out = decode_wsc(&input);
-
-	let res = serde_yml::to_string(&out)
-		.map(|it| fix_yaml_str(it))
-		.with_context(|| format!("serialising {wsc_name_path} as YAML"))?;
-
-	Ok(res)
-}
-
-pub fn untransform_wsc_file_command(wsc_name_path: &Utf8Path, docline_path: &Utf8Path) -> anyhow::Result<()> {
-	log::info!("Untransforming file {}", wsc_name_path.file_name().unwrap_or_default());
-	let script_text = std::fs::read_to_string(wsc_name_path)
-		.with_context(|| format!("reading {wsc_name_path}"))?;
-	let mut script: Script = serde_yml::from_str(&script_text)
-		.with_context(|| format!("parsing {wsc_name_path} as a decoded script"))?;
-
+/// Applies a text file to a parsed document: every raw text, `[translation]`, `[choice translation]`
+/// and notes line it holds lands in the document's model, so printing the document carries the
+/// translations as annotations above the instructions — and the choice translations as the
+/// annotations that name the arms.
+pub fn apply_doclines(doc: &mut AsmDocument, docline_path: &Utf8Path) -> anyhow::Result<()> {
+	log::info!("Applying messages of {}", docline_path.file_name().unwrap_or_default());
 	let docline_text = std::fs::read_to_string(docline_path)
 		.with_context(|| format!("reading {docline_path}"))?;
 	let (_, doclines) = parse_doclines(&docline_text)
 		.map_err(|err| anyhow!("parsing {docline_path} as translated script text: {err}"))?;
 
-	tl_reverse_transform_script(&mut script, doclines)
-		.with_context(|| format!("applying {docline_path} to {wsc_name_path}"))?;
-
-	let res = fix_yaml_str(serde_yml::to_string(&script)
-		.with_context(|| format!("serialising {wsc_name_path} as YAML"))?);
-	std::fs::write(wsc_name_path, res)
-		.with_context(|| format!("writing {wsc_name_path}"))?;
-
-	Ok(())
-}
-
-pub fn encode_wsc_file_command(yaml_name_path: &Utf8Path, out_dir_path: &Utf8Path) -> anyhow::Result<()> {
-	log::info!("Encoding file {}", yaml_name_path.file_name().unwrap_or_default());
-	let input = std::fs::read_to_string(yaml_name_path)
-		.with_context(|| format!("reading {yaml_name_path}"))?;
-
-	let script: Script = serde_yml::from_str(&input)
-		.with_context(|| format!("parsing {yaml_name_path} as a decoded script"))?;
-
-	validate_opcode_table(&script)
-		.map_err(|err| anyhow!("Refusing to encode {yaml_name_path}: {err}"))?;
-
-	let out = script.binary_serialise()
-		.with_context(|| format!("encoding {yaml_name_path}"))?;
-
-	let out_name = yaml_name_path.with_extension("").file_name()
-		.ok_or_else(|| anyhow!("{yaml_name_path} has no file name"))?
-		.to_owned();
-
-	std::fs::write(out_dir_path.join(&out_name), out)
-		.with_context(|| format!("writing {out_dir_path}/{out_name}"))?;
+	let script_path = doc.sources.first().map(|it| it.path.as_str()).unwrap_or_default();
+	tl_reverse_transform_script(&mut doc.script, doclines)
+		.with_context(|| format!("applying {docline_path} to {script_path}"))?;
 
 	Ok(())
 }
