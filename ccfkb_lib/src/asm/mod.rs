@@ -469,6 +469,7 @@ pub(crate) fn jump_field(opcode: u8, address: usize, destination: usize) -> u32 
 #[cfg(test)]
 mod test {
 	use super::*;
+	use crate::data::text_script::{parse_doclines, tl_reverse_transform_script, tl_transform_script};
 	use crate::opcodes::{Choice, OpField, Opcode, Script, TLString};
 	use camino::{Utf8Path, Utf8PathBuf};
 	use tempfile::TempDir;
@@ -1171,5 +1172,213 @@ choice_jump count: 0x01, separator: 0x00, choices:\n  arg1: SLOT_MAIN, text: \"�
 		assert_eq!(choices[0].arg1, 0x0001);
 		assert_eq!(choices[0].gate_value, 0x0352);
 		assert!(matches!(choices[0].payload[0], OpField::Byte(0x01)));
+	}
+
+	/// A `choice_jump`'s arms continue its string sequence, so the *k*-th `# translation` line of
+	/// the block above the opcode names the *k*-th record.
+	#[test]
+	fn annotations_above_a_choice_opcode_name_the_arms() {
+		let fixture = "# cc-fkb asm 1\n# script T.WSC\n\n\
+# translation \"First\"\n\
+# translation \"\"\n\
+# translation \"Third\"\n\
+choice_jump count: 0x03, separator: 0x00, choices:\n  arg1: 0x0001, text: \"いち\", gate_indirect: 0x01, gate_value: 0x0352, payload: 0x04\n  arg1: 0x0002, text: \"に\", gate_indirect: 0x01, gate_value: 0x0353, payload: 0x04\n  arg1: 0x0003, text: \"さん\", gate_indirect: 0x01, gate_value: 0x0354, payload: 0x04\n\
+\n#trailer [ ]\n";
+		let doc = parse_document(fixture, Utf8Path::new(NAME));
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+		let arms = |doc: &AsmDocument| match &doc.script.opcodes[0].fields[2] {
+			OpField::Choice(choices) => {
+				choices.iter().map(|it| it.choice_str.translation.clone()).collect::<Vec<_>>()
+			}
+			other => panic!("the instruction declares a choice list, found {other:?}"),
+		};
+		assert_eq!(arms(&doc), vec![Some("First".to_owned()), None, Some("Third".to_owned())]);
+
+		// The annotations print above the opcode line — never inside the block, whose lines are
+		// records — and the records themselves are what the file held.
+		let printed = print_document(&doc, NAME).unwrap();
+		let lines: Vec<&str> = printed.lines().collect();
+		let at = lines.iter().position(|it| it.starts_with("choice_jump")).expect("the opcode line");
+		assert_eq!(
+			&lines[at - 3..at],
+			&["# translation \"First\"", "# translation \"\"", "# translation \"Third\""]
+		);
+		assert!(
+			lines.iter().all(|it| !it.starts_with("  #")),
+			"nothing sits inside the block:\n{printed}"
+		);
+		assert_eq!(
+			&lines[at + 1..at + 4],
+			&[
+				"  arg1: 0x0001, text: \"いち\", gate_indirect: 0x01, gate_value: 0x0352, payload: 0x04",
+				"  arg1: 0x0002, text: \"に\", gate_indirect: 0x01, gate_value: 0x0353, payload: 0x04",
+				"  arg1: 0x0003, text: \"さん\", gate_indirect: 0x01, gate_value: 0x0354, payload: 0x04",
+			]
+		);
+		let again = parse_document(&printed, Utf8Path::new(NAME));
+		assert!(again.diagnostics.is_empty(), "{:#?}", again.diagnostics);
+		assert_eq!(arms(&again), arms(&doc), "the annotation block round-trips");
+		assert_eq!(print_document(&again, NAME).unwrap(), printed, "print → parse → print");
+	}
+
+	/// A block's arms are its records: an annotation past the last one named nothing, and says so.
+	#[test]
+	fn too_many_annotations_for_a_choice_list_is_a_finding() {
+		let fixture = "# cc-fkb asm 1\n# script T.WSC\n\n\
+# translation \"first\"\n\
+# translation \"second\"\n\
+# translation \"third\"\n\
+# translation \"fourth\"\n\
+choice_jump count: 0x02, separator: 0x00, choices:\n  arg1: 0x0001, text: \"いち\", gate_indirect: 0x01, gate_value: 0x0352, payload: 0x04\n  arg1: 0x0002, text: \"に\", gate_indirect: 0x01, gate_value: 0x0353, payload: 0x04\n\
+\n#trailer [ ]\n";
+		let doc = parse_document(fixture, Utf8Path::new(NAME));
+		let reported: Vec<(usize, Severity, &str)> = doc
+			.diagnostics
+			.iter()
+			.map(|it| (it.line, it.severity, it.message.as_str()))
+			.collect();
+		// A finding for each annotation that named no arm: the first two are the two records, and
+		// the annotation that missed is named at its own line.
+		assert_eq!(
+			reported,
+			vec![
+				(
+					6,
+					Severity::Flag,
+					"\"translation\" annotation on choice_jump (0x02), which has only 2 choice records"
+				),
+				(
+					7,
+					Severity::Flag,
+					"\"translation\" annotation on choice_jump (0x02), which has only 2 choice records"
+				),
+			]
+		);
+		let OpField::Choice(arms) = &doc.script.opcodes[0].fields[2] else { panic!("choice list") };
+		assert_eq!(arms[0].choice_str.translation.as_deref(), Some("first"));
+		assert_eq!(arms[1].choice_str.translation.as_deref(), Some("second"));
+	}
+
+	/// An annotation line indented into a `choices:` block names nothing: it is reported and reaches
+	/// neither an arm nor the instruction that follows the block.
+	#[test]
+	fn an_indented_annotation_inside_a_choices_block_is_a_finding() {
+		let fixture = "# cc-fkb asm 1\n# script T.WSC\n\n\
+choice_jump count: 0x02, separator: 0x00, choices:\n  arg1: 0x0001, text: \"いち\", gate_indirect: 0x01, gate_value: 0x0352, payload: 0x04\n  # translation \"x\"\n  # label LOOP\n  arg1: 0x0002, text: \"に\", gate_indirect: 0x01, gate_value: 0x0353, payload: 0x04\n\
+\n\
+textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"こんにちは\"\n\
+\n#trailer [ ]\n";
+		let doc = parse_document(fixture, Utf8Path::new(NAME));
+		let reported: Vec<(usize, usize, Severity, &str)> = doc
+			.diagnostics
+			.iter()
+			.map(|it| (it.line, it.column, it.severity, it.message.as_str()))
+			.collect();
+		assert_eq!(
+			reported,
+			vec![
+				(6, 3, Severity::Flag, "\"translation\" annotation inside a \"choices:\" block"),
+				(7, 3, Severity::Flag, "\"label\" annotation inside a \"choices:\" block"),
+			]
+		);
+		assert!(!doc.labels.contains_key("LOOP"), "an indented label defines nothing");
+		let OpField::Choice(arms) = &doc.script.opcodes[0].fields[2] else { panic!("choice list") };
+		assert!(arms.iter().all(|it| it.choice_str.translation.is_none()), "neither arm is named");
+		let OpField::String(text) = &doc.script.opcodes[1].fields[3] else { panic!("textbox text") };
+		assert_eq!(text.raw, "こんにちは");
+		assert_eq!(text.translation, None, "nothing leaked past the block");
+	}
+
+	/// The `.txt` sidecar's `[choice translation]` names the arm it belongs to, through the same
+	/// model an instruction's string operand goes through — so the edit reaches the asm as an
+	/// annotation above the opcode line and the sidecar regenerated from that text carries it.
+	#[test]
+	fn doclines_translate_the_arms_through_the_model() {
+		let fixture = "# cc-fkb asm 1\n# script T.WSC\n\n\
+choice_jump count: 0x02, separator: 0x00, choices:\n  arg1: 0x0001, text: \"いち\", gate_indirect: 0x01, gate_value: 0x0352, payload: 0x04\n  arg1: 0x0002, text: \"に\", gate_indirect: 0x01, gate_value: 0x0353, payload: 0x04\n\
+\n\
+textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"こんにちは\"\n\
+\n#trailer [ ]\n";
+		let mut doc = parse_document(fixture, Utf8Path::new(NAME));
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+
+		// The sidecar the toolchain writes, with the second arm and the textbox translated.
+		let sidecar = tl_transform_script(&doc.script).expect("transforming");
+		let mut arms_seen = 0;
+		let mut lines: Vec<String> = Vec::new();
+		for line in sidecar.lines() {
+			if line == "[choice translation]: " {
+				arms_seen += 1;
+				lines.push(if arms_seen == 2 {
+					"[choice translation]: TRANSLATED CHOICE".to_owned()
+				} else {
+					line.to_owned()
+				});
+			} else if line == "[translation]: " {
+				lines.push("[translation]: TRANSLATED LINE".to_owned());
+			} else {
+				lines.push(line.to_owned());
+			}
+		}
+		let (_, doclines) = parse_doclines(&lines.join("\n")).expect("reading the sidecar");
+		tl_reverse_transform_script(&mut doc.script, doclines).expect("applying the sidecar");
+
+		// The arm is named above the opcode line, in its own position: the first arm kept its text,
+		// so the printer emits the empty annotation that keeps the lines aligned with the records.
+		let printed = print_document(&doc, NAME).expect("printing");
+		let lines: Vec<&str> = printed.lines().collect();
+		let at = lines.iter().position(|it| it.starts_with("choice_jump")).expect("the opcode line");
+		assert_eq!(
+			&lines[at - 2..at],
+			&["# translation \"\"", "# translation \"TRANSLATED CHOICE\""]
+		);
+		assert!(
+			lines.iter().all(|it| !it.starts_with("  #")),
+			"no annotation lands on a record:\n{printed}"
+		);
+		assert_eq!(
+			lines[at + 1],
+			"  arg1: 0x0001, text: \"いち\", gate_indirect: 0x01, gate_value: 0x0352, payload: 0x04",
+			"the first record is untouched"
+		);
+		let textbox =
+			lines.iter().position(|it| it.starts_with("textbox_no_speaker")).expect("the textbox");
+		assert_eq!(
+			lines[textbox - 1],
+			"# translation \"TRANSLATED LINE%K%P\"",
+			"a textbox translation keeps the sidecar's suffix"
+		);
+
+		// The sidecar regenerated from the printed text carries both edits.
+		let again = parse_document(&printed, Utf8Path::new(NAME));
+		assert!(again.diagnostics.is_empty(), "{:#?}", again.diagnostics);
+		let regenerated = tl_transform_script(&again.script).expect("transforming");
+		assert!(regenerated.contains("[choice translation]: TRANSLATED CHOICE"), "{regenerated}");
+		assert!(regenerated.contains("[translation]: TRANSLATED LINE%K%P"), "{regenerated}");
+	}
+
+	/// A sidecar raw is a model string, not a trimmed one: the reader keeps it exactly as the writer
+	/// spelled it, so a text that opens with a full-width space survives the round trip.
+	#[test]
+	fn a_sidecar_raw_round_trips_verbatim() {
+		let fixture = "# cc-fkb asm 1\n# script T.WSC\n\n\
+textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"　先頭が全角空白\"\n\
+\n#trailer [ ]\n";
+		let doc = parse_document(fixture, Utf8Path::new(NAME));
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+		let sidecar = tl_transform_script(&doc.script).expect("transforming");
+		assert!(sidecar.contains("[original text @ 0x00000000]: 　先頭が全角空白"), "{sidecar}");
+		let (_, doclines) = parse_doclines(&sidecar).expect("reading the sidecar");
+		let mut rebuilt = doc.clone();
+		tl_reverse_transform_script(&mut rebuilt.script, doclines).expect("applying the sidecar");
+		let OpField::String(text) = &rebuilt.script.opcodes[0].fields[3] else {
+			panic!("textbox text")
+		};
+		assert_eq!(text.raw, "　先頭が全角空白");
+		assert_eq!(
+			print_document(&rebuilt, NAME).unwrap(),
+			print_document(&doc, NAME).unwrap(),
+			"applying an unedited sidecar rewrites nothing"
+		);
 	}
 }

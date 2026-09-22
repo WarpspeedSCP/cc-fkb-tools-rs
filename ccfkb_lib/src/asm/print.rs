@@ -489,15 +489,19 @@ fn named_number(
 		.map(|it| it.to_owned())
 }
 
-/// `# translation "…"` for every string operand that carries a translation. A preceding string
-/// operand without one gets an empty annotation when a later one has text, so the *k*-th annotation
-/// keeps naming the *k*-th string operand when the file is parsed again.
+/// `# translation "…"` for every string operand that carries a translation, and for every choice
+/// arm's `text`, which continues the instruction's string sequence in record order. A preceding
+/// element without one gets an empty annotation when a later one has text, so the *k*-th annotation
+/// keeps naming the *k*-th element of the sequence when the file is parsed again.
 fn translation_annotations(fields: &[OpField]) -> Vec<String> {
 	let strings: Vec<Option<&str>> = fields
 		.iter()
-		.filter_map(|it| match it {
-			OpField::String(value) => Some(value.translation.as_deref()),
-			_ => None,
+		.flat_map(|it| match it {
+			OpField::String(value) => vec![value.translation.as_deref()],
+			OpField::Choice(choices) => {
+				choices.iter().map(|it| it.choice_str.translation.as_deref()).collect()
+			}
+			_ => Vec::new(),
 		})
 		.collect();
 	let last = strings.iter().rposition(|it| it.is_some());

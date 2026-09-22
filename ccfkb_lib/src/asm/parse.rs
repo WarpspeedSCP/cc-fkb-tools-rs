@@ -9,7 +9,8 @@
 //! document semantics: addresses derived from the parsed operand sizes (`# addr` is only ever
 //! compared against them), labels — which resolve in a second pass, so forward references work —,
 //! choice blocks, the trailer, and `# translation` annotations, which apply positionally to an
-//! instruction's string operands.
+//! instruction's string sequence — its string operands, and, through a `choices:` block, its arms'
+//! texts, in record order.
 //!
 //! It also resolves the constants layer: the `include` annotations of the script are followed before
 //! its lines are read (see [`Loader`]), so every value token may spell a name from a `.inc` file
@@ -69,6 +70,19 @@ impl PendingAnnotations {
 	fn clear(&mut self) {
 		*self = PendingAnnotations::default();
 	}
+}
+
+/// The `choices:` block an instruction opened: where its records land, and the `# translation`
+/// annotations of the instruction's block, which name the arms in record order the way they name a
+/// string operand. One annotation is bound per record as that record is read, and `next` is the one
+/// the next record takes — so the leftovers are the annotations that named no arm.
+struct ChoiceSlot {
+	opcode_index: usize,
+	field_index: usize,
+	item_index: usize,
+	spec: &'static OpcodeSpecStatic,
+	annotations: Vec<(usize, usize, Option<String>)>,
+	next: usize,
 }
 
 /// What one line is, after its `;` comment has been split off. Every token borrows the line it was
@@ -206,7 +220,7 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 	let mut label_lines: BTreeMap<String, usize> = BTreeMap::new();
 	let mut jumps: Vec<PendingJump> = vec![];
 	let mut address = 0usize;
-	let mut choice_slot: Option<(usize, usize, usize)> = None;
+	let mut choice_slot: Option<ChoiceSlot> = None;
 	let mut trailer_line: Option<usize> = None;
 
 	let has_content = text.lines().any(|it| !it.trim().is_empty());
@@ -247,6 +261,15 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 		match parsed.kind {
 			LineKind::Blank | LineKind::Bad | LineKind::RejectedRecord => {}
 			LineKind::Annotation { key, value, column } => {
+				// annotations don't apply inside choice slots.
+				if choice_slot.is_some() && column > 1 {
+					out.diagnostics.push(flag(
+						number,
+						column,
+						format!("\"{key}\" annotation inside a \"choices:\" block"),
+					));
+					continue;
+				}
 				parse_annotation(
 					&mut out,
 					&mut pending,
@@ -265,64 +288,72 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 			)),
 			LineKind::RejectedInstruction { ends_choice_block } => {
 				if ends_choice_block {
-					choice_slot = None;
+					close_choice_block(&mut out, choice_slot.take());
 				}
 				pending.clear();
 			}
 			LineKind::Record { text, segments } => {
-				match choice_slot {
-					None => out.diagnostics.push(error(
+				let Some(slot) = choice_slot.as_mut() else {
+					out.diagnostics.push(error(
 						number,
 						1,
 						"choice record with no preceding \"choices:\" block".to_owned(),
-					)),
-					Some((opcode_index, field_index, item_index)) => {
-						let mut findings = Vec::new();
-						let choice_index = match &out.script.opcodes[opcode_index].fields[field_index]
-						{
-							OpField::Choice(choices) => choices.len(),
-							_ => 0,
-						};
-						match choice_record(raw, number, text, &segments, &constants, &mut findings) {
-							Ok((choice, record, payload_jumps)) => {
-								// A payload jump is resolved by the same pass as an instruction's, so
-								// its token is queued the same way.
-								for (operand_index, token) in payload_jumps {
-									jumps.push(PendingJump {
-										opcode_index,
-										slot: JumpSlot::Payload {
-											field_index,
-											choice_index,
-											operand_index,
-										},
-										line: number,
-										column: grammar::column_of(raw, token),
-										token,
-									});
-								}
-								if let OpField::Choice(choices) =
-									&mut out.script.opcodes[opcode_index].fields[field_index]
-								{
-									// The instruction line sized the choice list as empty; the records
-									// arrive on the lines that follow, so the running address has to grow
-									// with them.
-									address += choice.size();
-									choices.push(choice);
-								}
-								if let Some(item) = out.items.get_mut(item_index) {
-									item.records.push(record);
-								}
-							}
-							Err(message) => out.diagnostics.push(error(number, 1, message)),
+					));
+					continue;
+				};
+				let (opcode_index, field_index, item_index) =
+					(slot.opcode_index, slot.field_index, slot.item_index);
+				let mut findings = Vec::new();
+				let choice_index = match &out.script.opcodes[opcode_index].fields[field_index] {
+					OpField::Choice(choices) => choices.len(),
+					_ => 0,
+				};
+				match choice_record(raw, number, text, &segments, &constants, &mut findings) {
+					Ok((mut choice, record, payload_jumps)) => {
+						// The annotation block above the opcode line names this arm: the record
+						// takes the *k*-th annotation of that block, and an empty one clears the
+						// translation. Bound before the address grows, because a translated arm is
+						// longer than its `raw`.
+						if let Some((_, _, text)) = slot.annotations.get(slot.next) {
+							choice.choice_str.translation = text.clone();
 						}
-						for finding in findings {
-							out.diagnostics.push(finding_at(raw, number, finding));
+						slot.next += 1;
+						// A payload jump is resolved by the same pass as an instruction's, so
+						// its token is queued the same way.
+						for (operand_index, token) in payload_jumps {
+							jumps.push(PendingJump {
+								opcode_index,
+								slot: JumpSlot::Payload {
+									field_index,
+									choice_index,
+									operand_index,
+								},
+								line: number,
+								column: grammar::column_of(raw, token),
+								token,
+							});
+						}
+						if let OpField::Choice(choices) =
+							&mut out.script.opcodes[opcode_index].fields[field_index]
+						{
+							// The instruction line sized the choice list as empty; the records
+							// arrive on the lines that follow, so the running address has to grow
+							// with them.
+							address += choice.size();
+							choices.push(choice);
+						}
+						if let Some(item) = out.items.get_mut(item_index) {
+							item.records.push(record);
 						}
 					}
+					Err(message) => out.diagnostics.push(error(number, 1, message)),
+				}
+				for finding in findings {
+					out.diagnostics.push(finding_at(raw, number, finding));
 				}
 			}
 			LineKind::Instruction { mnemonic, operands } => {
-				choice_slot = None;
+				close_choice_block(&mut out, choice_slot.take());
 				let candidates: Vec<&'static OpcodeSpecStatic> =
 					OPCODE_SPECS.iter().filter(|it| it.name == mnemonic).collect();
 				if candidates.is_empty() {
@@ -451,28 +482,34 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 						item.label = Some(name.clone());
 					}
 				}
-				let strings: Vec<usize> = fields
-					.iter()
-					.enumerate()
-					.filter(|(_, it)| matches!(it, OpField::String(_)))
-					.map(|(i, _)| i)
-					.collect();
-				for (k, (line, column, text)) in pending.translations.iter().enumerate() {
-					let Some(field_index) = strings.get(k).copied() else {
-						out.diagnostics.push(flag(
-							*line,
-							*column,
-							format!(
-								"\"translation\" annotation on {mnemonic} (0x{:02X}), which has no string operand",
-								spec.opcode
-							),
-						));
-						continue;
-					};
-					if let OpField::String(value) = &mut fields[field_index] {
-						// An empty annotation clears the translation: `Some("")` would encode an
-						// empty string and silently destroy the operand's text.
-						value.translation = text.clone();
+				// The arms of a `choices:` block continue this instruction's string sequence, and
+				// they arrive on the lines below: the block takes the annotations and binds each one
+				// as its arm is read. Every other opcode applies them here.
+				let choice_field = spec.layout.iter().position(|it| matches!(it, Code::Choice));
+				if choice_field.is_none() {
+					let strings: Vec<usize> = fields
+						.iter()
+						.enumerate()
+						.filter(|(_, it)| matches!(it, OpField::String(_)))
+						.map(|(i, _)| i)
+						.collect();
+					for (k, (line, column, text)) in pending.translations.iter().enumerate() {
+						let Some(field_index) = strings.get(k).copied() else {
+							out.diagnostics.push(flag(
+								*line,
+								*column,
+								format!(
+									"\"translation\" annotation on {mnemonic} (0x{:02X}), which has no string operand",
+									spec.opcode
+								),
+							));
+							continue;
+						};
+						if let OpField::String(value) = &mut fields[field_index] {
+							// An empty annotation clears the translation: `Some("")` would encode an
+							// empty string and silently destroy the operand's text.
+							value.translation = text.clone();
+						}
 					}
 				}
 				for &(field_index, token) in &decoded.jump_tokens {
@@ -493,16 +530,17 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 				for field in &fields {
 					size += field.size();
 				}
-				if spec.layout.iter().any(|it| matches!(it, Code::Choice)) {
-					let field_index = spec
-						.layout
-						.iter()
-						.position(|it| matches!(it, Code::Choice))
-						.unwrap_or_default();
-					// The records of this instruction arrive on the lines below it, so the slot keeps
-					// where they land: the opcode, the field, and the item the tokens are recorded on.
-					choice_slot = Some((opcode_index, field_index, out.items.len()));
-				}
+				// The records of this instruction arrive on the lines below it, so the slot keeps
+				// where they land — the opcode, the field, the item the tokens are recorded on — and
+				// the annotations that will name its arms, one per record in order.
+				choice_slot = choice_field.map(|field_index| ChoiceSlot {
+					opcode_index,
+					field_index,
+					item_index: out.items.len(),
+					spec,
+					annotations: std::mem::take(&mut pending.translations),
+					next: 0,
+				});
 				out.script.opcodes.push(Opcode {
 					opcode: spec.opcode,
 					address,
@@ -516,6 +554,9 @@ pub fn parse_document(text: &str, path: &Utf8Path) -> AsmDocument {
 		}
 	}
 
+	// A block that runs to the end of the file is closed here, like one closed by the instruction
+	// that follows it.
+	close_choice_block(&mut out, choice_slot.take());
 	resolve_jumps(&mut out, &jumps);
 	check_choice_counts(&mut out);
 	// The loader's table is the document's: every operand above already resolved through it.
@@ -1256,6 +1297,32 @@ fn resolve_jumps(out: &mut AsmDocument, jumps: &[PendingJump]) {
 				}
 			}
 		}
+	}
+}
+
+/// Closes a `choices:` block. any annotations that are unmatched to an arm are reported.
+fn close_choice_block(out: &mut AsmDocument, slot: Option<ChoiceSlot>) {
+	let Some(slot) = slot else {
+		return;
+	};
+	let records = match out
+		.script
+		.opcodes
+		.get(slot.opcode_index)
+		.and_then(|it| it.fields.get(slot.field_index))
+	{
+		Some(OpField::Choice(choices)) => choices.len(),
+		_ => 0,
+	};
+	for (line, column, _) in slot.annotations.iter().skip(slot.next) {
+		out.diagnostics.push(flag(
+			*line,
+			*column,
+			format!(
+				"\"translation\" annotation on {} (0x{:02X}), which has only {records} choice records",
+				slot.spec.name, slot.spec.opcode
+			),
+		));
 	}
 }
 

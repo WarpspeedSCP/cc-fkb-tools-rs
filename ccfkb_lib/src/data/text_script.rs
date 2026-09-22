@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while};
-use nom::combinator::{map_res, value};
+use nom::combinator::{map_res, opt, value};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{preceded, terminated};
 use nom::IResult;
@@ -214,6 +214,17 @@ pub fn hex_int(input: &str) -> IResult<&str, u32> {
 		.parse(input)
 }
 
+/// An address as the sidecar writes it: `0x` and hex digits, the spelling `tl_transform_script`
+/// emits (`[original text @ 0x000003C3]`). `hex_int` is the decimal, prefix-less form the BMP file
+/// names use, so the two are separate parsers.
+pub fn sidecar_address(input: &str) -> IResult<&str, u32> {
+	map_res(
+		preceded(tag("0x"), take_while(|c: char| c.is_ascii_hexdigit())),
+		|it: &str| u32::from_str_radix(it, 16),
+	)
+		.parse(input)
+}
+
 pub enum TLTag {
 	Scene { address: u32 },
 	Speaker { address: u32 },
@@ -225,12 +236,12 @@ pub fn tltag(input: &str) -> IResult<&str, TLTag> {
 	map_res(
 		alt((
 			terminated(
-				(value("text", tag("[original text @ ")), hex_int),
+				(value("text", tag("[original text @ ")), sidecar_address),
 				tag("]:"),
 			),
-			terminated((value("speaker", tag("[speaker @ ")), hex_int), tag("]:")),
-			terminated((value("choice", tag("[choices @ ")), hex_int), tag("]")),
-			terminated((value("scene", tag("[scene title @ ")), hex_int), tag("]:")),
+			terminated((value("speaker", tag("[speaker @ ")), sidecar_address), tag("]:")),
+			terminated((value("choice", tag("[choices @ ")), sidecar_address), tag("]")),
+			terminated((value("scene", tag("[scene title @ ")), sidecar_address), tag("]:")),
 		)),
 		|(enum_thing, address)| match enum_thing {
 			"text" => Ok(TLTag::Text { address }),
@@ -382,6 +393,13 @@ impl std::fmt::Display for DocLine {
 //   }
 // }
 
+/// Splits the tag from the value of a `[tag]: value` line: the writer separates them with exactly
+/// one space, so that space is the separator and everything after it is data. A raw text may open
+/// with a full-width space (U+3000, which `trim` would destroy), so the value is kept verbatim.
+fn value_after_separator(text: &str) -> &str {
+	text.strip_prefix(' ').unwrap_or(text)
+}
+
 fn is_blank(input: &str) -> bool {
 	input.is_empty() || input.chars().all(|it| it.is_space() || it.is_newline())
 }
@@ -407,7 +425,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 					Some(tl.trim().to_string())
 				},
 				notes: None,
-				raw: raw.trim().to_string(),
+				raw: raw.to_string(),
 			};
 
 			let (rest, _) = take_until("[").parse(rest)?;
@@ -418,7 +436,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 				this_line.address = text_addr;
 
 				if !is_blank(raw) {
-					this_line.translation.raw = raw.trim().to_string();
+					this_line.translation.raw = value_after_separator(raw).to_string();
 				}
 
 				(rest, DocLine::SpeakerLine(this_line))
@@ -433,7 +451,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 			let (rest, _) = take_until("\n[").parse(rest)?;
 
 			if !is_blank(header_contents) {
-				textline.translation.raw = header_contents.trim().to_string();
+				textline.translation.raw = value_after_separator(header_contents).to_string();
 			}
 
 			(rest, DocLine::Line(textline))
@@ -445,7 +463,7 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 			let (rest, _) = take_until("\n[").parse(rest)?;
 
 			if !is_blank(header_contents) {
-				textline.translation.raw = header_contents.trim().to_string();
+				textline.translation.raw = value_after_separator(header_contents).to_string();
 			}
 
 			(rest, DocLine::Scene(textline))
@@ -456,7 +474,12 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 
 			let (rest, stuff) = many0(terminated(
 				(
-					preceded(tag("\n[choice original text]:"), take_until("\n[")),
+					// The writer puts a blank line between two arms' blocks, so every arm but the
+					// first is introduced by `\n\n[choice original text]:`.
+					preceded(
+						(tag("\n"), opt(tag("\n")), tag("[choice original text]:")),
+						take_until("\n["),
+					),
 					preceded(tag("\n[choice translation]:"), take_until("\n[")),
 					preceded(tag("\n[choice notes]:"), take_until(TL_CHOICE_END.as_str())),
 				),
@@ -477,13 +500,16 @@ pub fn parse_docline_group(input: &str) -> IResult<&str, DocLine> {
 				};
 
 				choiceline.choices.push(TLString {
-					raw: raw.trim().to_string(),
+					raw: value_after_separator(raw).to_string(),
 					translation,
 					notes,
 				});
 			}
 
-			let (rest, _) = (tag("\n"), tag(TL_LINE_END.as_str())).parse(rest)?;
+			// The last arm's block is followed by a blank line and then the line end the writer
+			// appends to the entry.
+			let (rest, _) =
+				preceded(take_while(|c: char| c == '\n'), tag(TL_LINE_END.as_str())).parse(rest)?;
 			return Ok((rest, DocLine::Choices(choiceline)));
 		}
 	};
