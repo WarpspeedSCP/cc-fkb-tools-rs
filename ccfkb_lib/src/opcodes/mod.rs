@@ -1,11 +1,9 @@
 use anyhow::anyhow;
 use crate::util::{encode_sjis, get_sjis_bytes, transmute_to_u16};
 use itertools::Itertools;
-use serde::Serializer;
-use serde_derive::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct TLString {
 	pub raw: String,
 	pub translation: Option<String>,
@@ -27,20 +25,13 @@ impl TLString {
 	}
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum OpField {
-	Byte(
-		#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
-		u8),
-	Word(
-		#[serde(serialize_with = "crate::opcodes::serialize_hex_u16")]
-		u16),
-	DWord(
-		#[serde(serialize_with = "crate::opcodes::serialize_hex_u32")]
-		u32),
+	Byte(u8),
+	Word(u16),
+	DWord(u32),
 	String(TLString),
 	Choice(Vec<Choice>),
-	#[serde(serialize_with = "crate::opcodes::serialize_inline_ints_vec")]
 	Padding(Vec<u8>),
 }
 
@@ -97,16 +88,12 @@ impl OpField {
 /// interpreter runs on this record when the option is taken. `payload_kind` is that opcode;
 /// [`Choice::PAYLOAD_KINDS`] are the three the interpreter dispatches, and any other kind carries no
 /// operand bytes.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Choice {
-	#[serde(serialize_with = "crate::opcodes::serialize_hex_u16")]
 	pub arg1: u16,
 	pub choice_str: TLString,
-	#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
 	pub gate_indirect: u8,
-	#[serde(serialize_with = "crate::opcodes::serialize_hex_u16")]
 	pub gate_value: u16,
-	#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
 	pub payload_kind: u8,
 	/// The payload opcode's operand fields, decoded with its own row of the opcode table. Empty for
 	/// every kind the interpreter does not dispatch.
@@ -167,68 +154,19 @@ pub struct OpcodeSpecStatic {
 	pub yields: bool,
 }
 
-/// Renders a layout with the same spelling the docs use: `b w b w p 1`.
-pub fn render_layout(layout: &[Code]) -> String {
-	layout
-		.iter()
-		.map(|code| match code {
-			Code::Byte => "b".to_owned(),
-			Code::Word => "w".to_owned(),
-			Code::DWord => "d".to_owned(),
-			Code::Str => "s".to_owned(),
-			Code::Choice => "c".to_owned(),
-			Code::Padding(n) => format!("p {n}"),
-		})
-		.collect::<Vec<_>>()
-		.join(" ")
-}
-
-/// Per-file opcode manifest entry. `decode_wsc` embeds one per opcode a file uses as the top-level
-/// `opcode_table:` block, and `encode` validates every entry against [`OPCODE_SPECS`].
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct OpcodeSpec {
-	#[serde(serialize_with = "serialize_hex_u8")]
-	pub opcode: u8,
-	pub name: String,
-	pub yields: bool,
-	pub layout: String,
-	#[serde(serialize_with = "serialize_flow_strings")]
-	pub operands: Vec<String>,
-}
-
-impl OpcodeSpecStatic {
-	pub fn to_manifest(&self) -> OpcodeSpec {
-		OpcodeSpec {
-			opcode: self.opcode,
-			name: self.name.to_owned(),
-			yields: self.yields,
-			layout: render_layout(self.layout),
-			operands: self.operands.iter().map(|it| (*it).to_owned()).collect(),
-		}
-	}
-}
-
 /// One decoded instruction. The mnemonic is deliberately absent: it is defined once in
-/// [`OPCODE_SPECS`] and, per file, in the `opcode_table:` manifest, so `opcode` is the only key an
-/// instruction needs.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// [`OPCODE_SPECS`], so `opcode` is the only key an instruction needs.
+#[derive(Clone, Debug)]
 pub struct Opcode {
-	#[serde(serialize_with = "crate::opcodes::serialize_hex_u8")]
 	pub opcode: u8,
-	#[serde(serialize_with = "crate::opcodes::serialize_hex_usize")]
 	pub address: usize,
-	#[serde(skip)]
 	pub actual_address: usize,
 	pub fields: Vec<OpField>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Script {
-	/// Global opcode manifest: mnemonic, layout and operand names for every opcode this file uses.
-	/// Emitted once per file (sorted by opcode byte) so instruction records stay positional.
-	pub opcode_table: Vec<OpcodeSpec>,
 	pub opcodes: Vec<Opcode>,
-	#[serde(serialize_with = "crate::opcodes::serialize_inline_ints_vec")]
 	pub trailer: Vec<u8>,
 }
 
@@ -374,139 +312,9 @@ impl Opcode {
 	}
 }
 
-pub fn serialize_inline_ints_slice<S>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	let string = format!(
-		"[ {} ]",
-		data
-			.iter()
-			.map(|int| format!("0x{int:02X}"))
-			.collect::<Vec<_>>()
-			.join(", ")
-	);
-
-	serializer.serialize_str(&string)
-}
-
-#[allow(dead_code)]
-pub fn serialize_hex_usize<S>(data: &usize, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	serializer.serialize_str(&format!(r#""0x{data:08X}""#))
-}
-
-pub fn serialize_hex_u32<S>(data: &u32, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	serializer.serialize_str(&format!(r#""0x{data:08X}""#))
-}
-
-pub fn serialize_hex_u16<S>(data: &u16, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	serializer.serialize_str(&format!(r#""0x{data:04X}""#))
-}
-
-pub fn serialize_opt_hex_u16<S>(data: &Option<u16>, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	match data {
-		Some(inner) => serializer.serialize_str(&format!(r#""0x{inner:04X}""#)),
-		None => serializer.serialize_none(),
-	}
-}
-
-pub fn serialize_hex_u8<S>(data: &u8, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	serializer.serialize_str(&format!(r#""0x{data:02X}""#))
-}
-
-pub fn serialize_inline_ints_vec<S>(data: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	let string = format!(
-		"[ {} ]",
-		data
-			.iter()
-			.map(|int| format!("0x{int:02X}"))
-			.collect::<Vec<_>>()
-			.join(", ")
-	);
-
-	serializer.serialize_str(&string)
-}
-
-/// Emits a `Vec<String>` as one inline flow sequence; `data::fix_yaml_str` unquotes it, which is how
-/// `!Padding [ … ]` is emitted too.
-pub fn serialize_flow_strings<S>(data: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
-where
-	S: Serializer,
-{
-	serializer.serialize_str(&format!("[ {} ]", data.join(", ")))
-}
-
-/// Global opcode manifest for a decoded instruction list: one entry per distinct opcode byte it
-/// uses, ascending. This is the `opcode_table:` block of a decoded file, and the reason a script
-/// carries its own mnemonic/operand/control-flow documentation.
-pub fn manifest_for(opcodes: &[Opcode]) -> Vec<OpcodeSpec> {
-	let mut used = BTreeMap::new();
-	for op in opcodes {
-		used.insert(op.opcode, ());
-	}
-	used.keys()
-		.filter_map(|byte| lookup_spec(*byte).map(|spec| spec.to_manifest()))
-		.collect()
-}
-
 /// Looks up the compiled-in spec for an opcode byte.
 pub fn lookup_spec(opcode: u8) -> Option<&'static OpcodeSpecStatic> {
 	OPCODE_SPECS.iter().find(|it| it.opcode == opcode)
-}
-
-/// Validates a parsed script against the compiled-in spec: every `opcode_table:` entry must match
-/// its spec row exactly, and every instruction's opcode byte must be a known, listed opcode.
-pub fn validate_opcode_table(script: &Script) -> Result<(), String> {
-	for entry in &script.opcode_table {
-		let spec = lookup_spec(entry.opcode)
-			.ok_or_else(|| format!("opcode_table lists unknown opcode 0x{:02X}", entry.opcode))?;
-		let expected = spec.to_manifest();
-		if *entry != expected {
-			return Err(format!(
-				"opcode_table entry 0x{:02X} disagrees with the compiled opcode table: {entry:?} (expected {expected:?})",
-				entry.opcode
-			));
-		}
-	}
-
-	for op in &script.opcodes {
-		if lookup_spec(op.opcode).is_none() {
-			return Err(format!(
-				"instruction at 0x{:08X} uses unknown opcode 0x{:02X}",
-				op.address, op.opcode
-			));
-		}
-		if !script
-			.opcode_table
-			.iter()
-			.any(|it| it.opcode == op.opcode)
-		{
-			return Err(format!(
-				"instruction at 0x{:08X} uses opcode 0x{:02X}, which is missing from opcode_table",
-				op.address, op.opcode
-			));
-		}
-	}
-
-	Ok(())
 }
 
 /// Where a payload opcode's operands end, given the row that describes them, or `None` when the
@@ -638,7 +446,7 @@ macro_rules! decode_components {
 
 /// The single source of truth for opcode mnemonics, layouts and operand names: one row per
 /// implemented opcode, in ascending opcode order. Expands to [`OPCODE_SPECS`] and to the decoder
-/// used by [`make_opcode`], so the table, the decoder and the YAML manifest cannot drift apart.
+/// used by [`make_opcode`], so the table and the decoder cannot drift apart.
 ///
 /// Row grammar: `0xNN => mnemonic [ operand_name: code, … ]`, one entry per emitted field
 /// (padding included, spelled `pad: p <bytes>`), with an optional trailing `yields` marker before
@@ -663,8 +471,8 @@ macro_rules! opcode_table {
 		];
 
 		/// Decodes an opcode's payload into fields, in table order. The mnemonic is not carried on the
-		/// decoded instruction — it is defined once in this table and, per file, in the
-		/// `opcode_table:` manifest — so only the opcode byte keys an instruction.
+		/// decoded instruction — it is defined once in this table — so only the opcode byte keys an
+		/// instruction.
 		pub(crate) fn decode_opcode_fields(opcode: u8, input: &[u8]) -> Option<Vec<OpField>> {
 			let mut ptr = 1usize;
 			let mut fields: Vec<OpField> = vec![];
@@ -830,7 +638,6 @@ pub fn make_opcode(input: &[u8], addr: usize) -> Option<Opcode> {
 #[cfg(test)]
 mod spec_test {
 	use super::*;
-	use crate::data::{decode_wsc, fix_yaml_str};
 
 	/// Operand names as reviewed against `validation/opcodes/reference.md` (with `layouts.md` for
 	/// offsets/widths and `heap-access.md` for variable-index operands) on 2026-09-20, one row per
@@ -1063,103 +870,6 @@ mod spec_test {
 				spec.name
 			);
 		}
-	}
-
-	fn sample_script() -> Script {
-		// 0x03 variable_heap_op (8 bytes) then 0xFF end_of_script.
-		decode_wsc(&[0x03, 0x01, 0xC7, 0x02, 0x00, 0x00, 0x00, 0x00, 0xFF])
-	}
-
-	#[test]
-	fn manifest_is_emitted_once_per_file_for_the_opcodes_in_use() {
-		let script = sample_script();
-		assert_eq!(
-			script
-				.opcode_table
-				.iter()
-				.map(|it| it.opcode)
-				.collect::<Vec<_>>(),
-			vec![0x03, 0xFF]
-		);
-
-		let yaml = fix_yaml_str(serde_yml::to_string(&script).unwrap());
-		assert!(yaml.starts_with("opcode_table:"), "manifest must lead the file:\n{yaml}");
-		assert!(
-			yaml.contains("operands: [ kind, var_index, indirect, value, pad ]"),
-			"operand names must be emitted inline:\n{yaml}"
-		);
-		assert!(
-			yaml.contains("layout: b w b w p 1"),
-			"layout must use the code spelling:\n{yaml}"
-		);
-		assert_eq!(script.opcode_table[0].name, "variable_heap_op");
-		// The mnemonic is defined once, in the manifest: instruction records carry no name.
-		let body_at = yaml.find("\nopcodes:").expect("emitted file has no opcode list");
-		assert!(
-			!yaml[body_at..].contains("name:"),
-			"instructions must not repeat the mnemonic:\n{yaml}"
-		);
-
-		let back: Script = serde_yml::from_str(&yaml).unwrap();
-		assert_eq!(back.opcode_table, script.opcode_table);
-		assert_eq!(back.binary_serialise().unwrap(), script.binary_serialise().unwrap());
-	}
-
-	#[test]
-	fn instructions_carry_no_mnemonic_but_stale_name_keys_still_parse() {
-		// Files written before the mnemonic was removed repeated `name:` on every instruction.
-		let stale = "\
-opcode_table:
-- opcode: 0x03
-  name: variable_heap_op
-  yields: false
-  layout: b w b w p 1
-  operands: [ kind, var_index, indirect, value, pad ]
-opcodes:
-- name: variable_heap_op
-  opcode: 0x03
-  address: 0x00000000
-  fields:
-  - !Byte 0x01
-  - !Word 0x02C7
-  - !Byte 0x00
-  - !Word 0x0000
-  - !Padding [ 0x00 ]
-trailer: [  ]
-";
-		let script: Script =
-			serde_yml::from_str(stale).expect("a stale instruction `name:` key must not break parsing");
-		assert_eq!(script.opcodes.len(), 1);
-		assert_eq!(script.opcode_table.len(), 1);
-		assert!(validate_opcode_table(&script).is_ok());
-		// Re-emitting drops the stale key: the mnemonic lives in the manifest only.
-		let yaml = fix_yaml_str(serde_yml::to_string(&script).unwrap());
-		let body_at = yaml.find("\nopcodes:").expect("emitted file has no opcode list");
-		assert!(!yaml[body_at..].contains("name:"), "{yaml}");
-	}
-
-	#[test]
-	fn encode_rejects_a_manifest_that_disagrees_with_the_compiled_table() {
-		let script = sample_script();
-		assert!(validate_opcode_table(&script).is_ok());
-
-		let mut renamed = script.opcode_table.clone();
-		renamed[0].operands[0] = "renamed_by_hand".to_owned();
-		let tampered = Script {
-			opcode_table: renamed,
-			opcodes: script.opcodes.clone(),
-			trailer: script.trailer.clone(),
-		};
-		let err = validate_opcode_table(&tampered).expect_err("renamed operand must be rejected");
-		assert!(err.contains("disagrees with the compiled opcode table"), "{err}");
-
-		let missing = Script {
-			opcode_table: script.opcode_table[..1].to_vec(),
-			opcodes: script.opcodes.clone(),
-			trailer: script.trailer.clone(),
-		};
-		let err = validate_opcode_table(&missing).expect_err("unlisted opcode must be rejected");
-		assert!(err.contains("missing from opcode_table"), "{err}");
 	}
 
 	#[test]

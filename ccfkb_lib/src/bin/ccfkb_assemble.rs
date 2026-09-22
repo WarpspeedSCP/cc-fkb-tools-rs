@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context};
 use ccfkb_lib::asm::Severity;
 use ccfkb_lib::bin_utils::load_asm_file_command;
 use ccfkb_lib::main_preamble;
-use ccfkb_lib::opcodes::validate_opcode_table;
 use ccfkb_lib::util::{entries_with_suffix, safe_create_dir};
 
 /// Assembles every `.WSC.asm` under an `<arc>.arc.asm` directory back into `<arc>/<NAME>.WSC`.
@@ -34,8 +33,6 @@ fn main() -> anyhow::Result<()> {
 			}
 
 			let script = doc.into_script()?;
-			validate_opcode_table(&script)
-				.map_err(|err| anyhow!("refusing to assemble {file}: {err}"))?;
 			let out = script
 				.binary_serialise()
 				.with_context(|| format!("assembling {file}"))?;

@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
 		std::fs::create_dir_all(&path)
 			.with_context(|| format!("creating {path}"))?;
 
-		// Only the decoded contents matter here; the descriptors come from the sidecar YAMLs.
+		// Only the decoded contents matter here; the descriptors come from what is on disk.
 		let ArcContents {
 			filenames,
 			data,

@@ -1,9 +1,8 @@
 use anyhow::{bail, Context};
 use std::collections::BTreeMap;
-use crate::opcodes::{make_opcode, manifest_for, Script};
+use crate::opcodes::{make_opcode, Script};
 use crate::util::{encode_sjis, get_sjis_bytes, get_sjis_bytes_of_length, safe_create_dir, to_bytes, transmute_to_u32, lz77_decompress, lz77_compress};
 use camino::{Utf8Path as Utf8Path, Utf8PathBuf};
-use serde_derive::{Deserialize, Serialize};
 use crate::data::text_script::hex_int;
 
 pub mod text_script;
@@ -169,7 +168,7 @@ impl WIPFENTRY {
 	}
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct ExtensionDescriptor {
 	pub name: String,
 	pub number: u32,
@@ -182,7 +181,7 @@ impl ExtensionDescriptor {
 	}
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct FileDescriptor {
 	pub name: String,
 	pub size: u32,
@@ -193,13 +192,6 @@ impl FileDescriptor {
 	pub fn size(&self) -> usize {
 		(encode_sjis(&self.name[..13]).len() + 1) + 4 + 4
 	}
-}
-
-pub fn fix_yaml_str(it: String) -> String {
-	it.replace("'[", "[")
-		.replace("]'", "]")
-		.replace(r#"'""#, "")
-		.replace(r#""'"#, "")
 }
 
 pub struct ArcContents<'a> {
@@ -430,8 +422,8 @@ pub fn gen_descriptors_from_files(files: &[Utf8PathBuf]) -> anyhow::Result<(Vec<
 
 /// Direct content entries of an extracted arc directory, sorted.
 ///
-/// The YAML sidecars (`files.yaml`, `extensions.yaml`) are metadata rather than arc
-/// content, so they are excluded.
+/// The YAML trees are the retired decoded-script form, generated beside an arc rather than arc
+/// content, so they are excluded and a packed arc carries none.
 pub fn arc_entries(arc_dir: &Utf8Path) -> std::io::Result<Vec<Utf8PathBuf>> {
 	let mut entries = vec![];
 	for entry in arc_dir.read_dir_utf8()? {
@@ -856,14 +848,7 @@ pub fn decode_wsc(input: &[u8]) -> Script {
 		input[ptr..].to_vec()
 	};
 
-	// Global opcode manifest: one entry per opcode this file uses, ascending.
-	let opcode_table = manifest_for(&opcodes);
-
-	let out = Script {
-		opcode_table,
-		opcodes,
-		trailer: rest,
-	};
+	let out = Script { opcodes, trailer: rest };
 
 	out
 }

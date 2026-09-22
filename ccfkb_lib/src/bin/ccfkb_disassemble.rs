@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
 
 	for file in main_preamble!(file ".WSC") {
 		// The WSC lives inside the extracted arc dir; its assembly goes into the sibling
-		// `<arc>.arc.asm` folder, mirroring ccfkb_decode's `<arc>.arc.yaml`.
+		// `<arc>.arc.asm` folder, beside the translator's `<arc>.arc.script`.
 		let asm_dir = file
 			.parent()
 			.ok_or_else(|| anyhow!("expected {file} to live inside an arc directory"))?
