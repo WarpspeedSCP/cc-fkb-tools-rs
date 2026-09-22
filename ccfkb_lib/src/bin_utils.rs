@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context};
-use crate::data::text_script::{parse_doclines, tl_reverse_transform_script, tl_transform_script};
+use crate::data::text_script::{
+	parse_doclines, renumber_entries, tl_reverse_transform_script, tl_transform_script,
+};
 use crate::asm::parse::load_constants;
 use crate::asm::{
 	parse_document, print_script, print_script_with_constants, AsmDocument, ConstantTable,
@@ -28,10 +30,18 @@ pub fn transform_asm_file_command(asm_path: &Utf8Path, out_file: &Utf8Path) -> a
 /// and notes line it holds lands in the document's model, so printing the document carries the
 /// translations as annotations above the instructions — and the choice translations as the
 /// annotations that name the arms.
-pub fn apply_doclines(doc: &mut AsmDocument, docline_path: &Utf8Path) -> anyhow::Result<()> {
+///
+/// An entry whose address is not the document's is paired with the instruction it describes (same
+/// kind, same position, same raw texts — see `text_script::repoint_entries`), so a text written
+/// against an older layout is still applied to the instructions it belongs to. The number of tags
+/// that had to be renumbered comes back; the file itself is not touched here, `sync_sidecar` is what
+/// writes it.
+pub fn apply_doclines(doc: &mut AsmDocument, docline_path: &Utf8Path) -> anyhow::Result<usize> {
 	log::info!("Applying messages of {}", docline_path.file_name().unwrap_or_default());
 	let docline_text = std::fs::read_to_string(docline_path)
 		.with_context(|| format!("reading {docline_path}"))?;
+	let (docline_text, moved) = renumber_entries(&docline_text, &doc.script)
+		.with_context(|| format!("pairing {docline_path} with the script"))?;
 	let (_, doclines) = parse_doclines(&docline_text)
 		.map_err(|err| anyhow!("parsing {docline_path} as translated script text: {err}"))?;
 
@@ -39,7 +49,23 @@ pub fn apply_doclines(doc: &mut AsmDocument, docline_path: &Utf8Path) -> anyhow:
 	tl_reverse_transform_script(&mut doc.script, doclines)
 		.with_context(|| format!("applying {docline_path} to {script_path}"))?;
 
-	Ok(())
+	Ok(moved)
+}
+
+/// Renumbers a text file's entry tags to the instructions the assembly beside it now holds, keeping
+/// every translation, note and raw byte for byte — what a rebuild that moved addresses leaves behind.
+/// The file is written only when a tag actually moved, and the count of moved tags comes back.
+pub fn sync_sidecar(docline_path: &Utf8Path, asm_path: &Utf8Path) -> anyhow::Result<usize> {
+	let text = std::fs::read_to_string(docline_path)
+		.with_context(|| format!("reading {docline_path}"))?;
+	let doc = load_asm_file_command(asm_path)?;
+	let (renumbered, moved) = renumber_entries(&text, &doc.script)
+		.with_context(|| format!("pairing {docline_path} with {asm_path}"))?;
+	if moved > 0 {
+		std::fs::write(docline_path, renumbered)
+			.with_context(|| format!("writing {docline_path}"))?;
+	}
+	Ok(moved)
 }
 
 /// Reads a decoded `.WSC` and returns its assembly text: canonically, or naming every value the

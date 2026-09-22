@@ -1,5 +1,5 @@
 use anyhow::{bail, Context};
-use crate::opcodes::{Choice, OpField, Opcode, Script, TLString};
+use crate::opcodes::{lookup_spec, Choice, Code, OpField, Opcode, Script, TLString};
 use std::collections::HashMap;
 
 use nom::branch::alt;
@@ -272,6 +272,233 @@ pub struct SpeakerLine {
 pub struct ChoiceLine {
 	address: u32,
 	choices: Vec<TLString>,
+}
+
+/// The opcodes a sidecar entry can describe. A `[scene title @ …]` entry describes `0xE0`, a
+/// `[original text @ …]` one `0x41`, a `[speaker @ …]` one `0x42`, and a `[choices @ …]` one `0x02`.
+const TEXT_OPCODES: [u8; 4] = [0x41, 0x42, 0x02, 0xE0];
+
+/// One instruction a sidecar entry can describe: its opcode, its address, and the raw texts the entry
+/// has to carry — the instruction's whole string sequence, which is what `print_document` reads its
+/// `translation` annotations from.
+struct TextInstruction {
+	opcode: u8,
+	address: usize,
+	raws: Vec<String>,
+}
+
+impl TextInstruction {
+	fn mnemonic(&self) -> &'static str {
+		lookup_spec(self.opcode).map(|it| it.name).unwrap_or("?")
+	}
+}
+
+/// Every instruction a sidecar entry can describe, in file order.
+fn text_instructions(script: &Script) -> Vec<TextInstruction> {
+	let mut out = Vec::new();
+	for opcode in &script.opcodes {
+		if !TEXT_OPCODES.contains(&opcode.opcode) {
+			continue;
+		}
+		let Some(spec) = lookup_spec(opcode.opcode) else {
+			continue;
+		};
+		let mut raws = Vec::new();
+		for (index, code) in spec.layout.iter().enumerate() {
+			match code {
+				Code::Str => {
+					if let Some(OpField::String(text)) = opcode.fields.get(index) {
+						raws.push(text.raw.clone());
+					}
+				}
+				// A choice list continues the sequence, exactly as it continues the annotations.
+				Code::Choice => {
+					if let Some(OpField::Choice(choices)) = opcode.fields.get(index) {
+						raws.extend(choices.iter().map(|it| it.choice_str.raw.clone()));
+					}
+				}
+				_ => {}
+			}
+		}
+		out.push(TextInstruction { opcode: opcode.opcode, address: opcode.address, raws });
+	}
+	out
+}
+
+/// The opcode an entry describes: the tag it was written under decides it.
+fn entry_opcode(entry: &DocLine) -> u8 {
+	match entry {
+		DocLine::Line(_) => 0x41,
+		DocLine::SpeakerLine(_) => 0x42,
+		DocLine::Choices(_) => 0x02,
+		DocLine::Scene(_) => 0xE0,
+	}
+}
+
+/// What an entry calls itself in a diagnostic.
+fn entry_kind(entry: &DocLine) -> &'static str {
+	match entry {
+		DocLine::Line(_) => "text",
+		DocLine::SpeakerLine(_) => "speaker",
+		DocLine::Choices(_) => "choice list",
+		DocLine::Scene(_) => "scene title",
+	}
+}
+
+/// The raw texts an entry carries, in the order the writer emits them.
+fn entry_raws(entry: &DocLine) -> Vec<&str> {
+	match entry {
+		DocLine::Line(line) | DocLine::Scene(line) => vec![line.translation.raw.as_str()],
+		DocLine::SpeakerLine(line) => {
+			vec![line.speaker_translation.raw.as_str(), line.translation.raw.as_str()]
+		}
+		DocLine::Choices(line) => line.choices.iter().map(|it| it.raw.as_str()).collect(),
+	}
+}
+
+fn entry_address(entry: &DocLine) -> usize {
+	match entry {
+		DocLine::Line(line) | DocLine::Scene(line) => line.address as usize,
+		DocLine::SpeakerLine(line) => line.address as usize,
+		DocLine::Choices(line) => line.address as usize,
+	}
+}
+
+fn set_entry_address(entry: &mut DocLine, address: usize) {
+	match entry {
+		DocLine::Line(line) | DocLine::Scene(line) => line.address = address as u32,
+		DocLine::SpeakerLine(line) => {
+			line.address = address as u32;
+			line.speaker_address = address as u32;
+		}
+		DocLine::Choices(line) => line.address = address as u32,
+	}
+}
+
+/// Pairs every entry of a text file with the instruction it describes, and moves the entry there.
+///
+/// The pairing is by kind and position — the *k*-th text entry belongs to the *k*-th text
+/// instruction — and the raw texts are the witness: an entry whose texts are not that instruction's is
+/// refused, never applied to a neighbour. That is what lets a text written against an older layout
+/// still be applied, e.g. after an instruction was inserted by hand, and it is why the addresses in
+/// the text cannot be their own authority: they are what the pairing corrects. Returns how many
+/// entries moved.
+pub fn repoint_entries(doclines: &mut [DocLine], script: &Script) -> anyhow::Result<usize> {
+	let instructions = text_instructions(script);
+	let mut cursors: HashMap<u8, usize> = HashMap::new();
+	let mut moved = 0;
+	for entry in doclines.iter_mut() {
+		let opcode = entry_opcode(entry);
+		let (kind, found) = (entry_kind(entry), entry_raws(entry));
+		let sequence: Vec<&TextInstruction> =
+			instructions.iter().filter(|it| it.opcode == opcode).collect();
+		let index = cursors.entry(opcode).or_default();
+		let Some(instruction) = sequence.get(*index) else {
+			bail!(
+				"the {kind} at 0x{:08X} has no {} (0x{opcode:02X}) left to be applied to",
+				entry_address(entry),
+				lookup_spec(opcode).map(|it| it.name).unwrap_or("instruction")
+			);
+		};
+		let want: Vec<&str> = instruction.raws.iter().map(String::as_str).collect();
+		if found != want {
+			bail!(
+				"the {kind} at 0x{:08X} holds {found:?} but the {} (0x{opcode:02X}) at 0x{:08X} holds {want:?}; the text and the script disagree about it",
+				entry_address(entry),
+				instruction.mnemonic(),
+				instruction.address
+			);
+		}
+		if instruction.address != entry_address(entry) {
+			moved += 1;
+		}
+		set_entry_address(entry, instruction.address);
+		*index += 1;
+	}
+	// Entries after a gap would otherwise pair with the instruction after the one they describe.
+	for (opcode, count) in &cursors {
+		let total = instructions.iter().filter(|it| it.opcode == *opcode).count();
+		if *count != total {
+			bail!(
+				"the text describes {count} {} (0x{opcode:02X}) instruction(s) but the script has {total}",
+				lookup_spec(*opcode).map(|it| it.name).unwrap_or("?")
+			);
+		}
+	}
+	for instruction in &instructions {
+		if !cursors.contains_key(&instruction.opcode) {
+			bail!(
+				"{} (0x{:02X}) at 0x{:08X} has no entry in the text",
+				instruction.mnemonic(),
+				instruction.opcode,
+				instruction.address
+			);
+		}
+	}
+	Ok(moved)
+}
+
+/// The `0x` prefix of a tag's address and the text after its digits: the tags are `[key @ 0x{8
+/// digits}]` and `[key @ 0x{8 digits}]:`, and only the digits are ever rewritten.
+fn split_tag(body: &str) -> (&str, Option<&str>, &str) {
+	let Some(at) = body.find("0x") else {
+		return (body, None, "");
+	};
+	let digits_at = at + 2;
+	let count = body[digits_at..].chars().take_while(|it| it.is_ascii_hexdigit()).count();
+	(&body[..digits_at], Some(&body[digits_at..digits_at + count]), &body[digits_at + count..])
+}
+
+/// Rewrites the `@ 0x…` address of every entry tag in a text file, in the order the tags appear, and
+/// leaves every other byte of the file as it was. `addresses` is one address per entry, in file order;
+/// a speaker's two tags name the same entry, so both take its address. Returns the text and how many
+/// tags moved.
+pub fn relabel_tags(text: &str, addresses: &[usize]) -> (String, usize) {
+	let mut out = String::with_capacity(text.len());
+	let mut next = addresses.iter();
+	let mut speaker: Option<usize> = None;
+	let mut moved = 0usize;
+	for chunk in text.split_inclusive('\n') {
+		let body = chunk.strip_suffix('\n').unwrap_or(chunk);
+		let tail = &chunk[body.len()..];
+		let address = if body.starts_with("[speaker @ ") {
+			let address = next.next().copied();
+			speaker = address;
+			address
+		} else if body.starts_with("[original text @ ") {
+			speaker.take().or_else(|| next.next().copied())
+		} else if body.starts_with("[scene title @ ") || body.starts_with("[choices @ ") {
+			next.next().copied()
+		} else {
+			None
+		};
+		if let Some(address) = address {
+			let (head, digits, rest) = split_tag(body);
+			if let Some(digits) = digits.filter(|it| it.len() == 8) {
+				let renumbered = format!("{address:08X}");
+				if renumbered != digits {
+					moved += 1;
+					out.push_str(head);
+					out.push_str(&renumbered);
+					out.push_str(rest);
+					out.push_str(tail);
+					continue;
+				}
+			}
+		}
+		out.push_str(chunk);
+	}
+	(out, moved)
+}
+
+/// The text file's own text with every entry renumbered to the instructions `script` holds, and how
+/// many tags moved. `0` means the text already named them.
+pub fn renumber_entries(text: &str, script: &Script) -> anyhow::Result<(String, usize)> {
+	let (_, mut doclines) = parse_doclines(text)
+		.map_err(|err| anyhow::anyhow!("parsing the translated script text: {err}"))?;
+	repoint_entries(&mut doclines, script)?;
+	let addresses: Vec<usize> = doclines.iter().map(entry_address).collect();
+	Ok(relabel_tags(text, &addresses))
 }
 
 #[derive(Debug)]

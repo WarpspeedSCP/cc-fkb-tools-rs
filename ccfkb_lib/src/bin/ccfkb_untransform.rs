@@ -1,14 +1,15 @@
 use anyhow::{anyhow, bail, Context};
 use ccfkb_lib::asm::print_document;
-use ccfkb_lib::bin_utils::{apply_doclines, load_asm_file_command, render_diagnostics};
+use ccfkb_lib::bin_utils::{apply_doclines, load_asm_file_command, render_diagnostics, sync_sidecar};
 use ccfkb_lib::main_preamble;
 use ccfkb_lib::util::entries_with_suffix;
 
 /// Applies every `<arc>.arc.script/<NAME>.WSC.txt` to the assembly beside it, in place: a
 /// translation becomes an annotation above its instruction, and a choice block's arms take theirs in
-/// record order. An assembly file with an error is refused — the text is not applied and the process
-/// exits non-zero — while findings alone are reported and applied, exactly as `ccfkb_assemble`
-/// treats them.
+/// record order. The text is then renumbered to the layout the rebuilt assembly has, so the two files
+/// keep naming the same instructions and the translator can keep editing without regenerating
+/// anything. An assembly file with an error is refused — the text is not applied and the process exits
+/// non-zero — while findings alone are reported and applied, exactly as `ccfkb_assemble` treats them.
 fn main() -> anyhow::Result<()> {
 	let mut refused = false;
 	for script_dir in main_preamble!(dir ".arc.script") {
@@ -37,10 +38,19 @@ fn main() -> anyhow::Result<()> {
 				continue;
 			}
 
-			apply_doclines(&mut doc, &file)?;
+			let stale = apply_doclines(&mut doc, &file)?;
 			let printed = print_document(&doc, asm_file.file_stem().unwrap_or_default())?;
 			std::fs::write(&asm_file, printed)
 				.with_context(|| format!("writing {asm_file}"))?;
+			// The translations just applied moved every address after them, so the text is renumbered to
+			// the layout its assembly now has: the two files keep naming the same instructions, and the
+			// translator can keep editing without regenerating anything.
+			let moved = sync_sidecar(&file, &asm_file)?;
+			if moved > 0 {
+				log::info!(
+					"{file}: renumbered {moved} address tag(s) to {asm_file} ({stale} were stale before applying)"
+				);
+			}
 		}
 	}
 

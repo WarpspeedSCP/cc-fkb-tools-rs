@@ -463,6 +463,7 @@ pub(crate) fn jump_field(opcode: u8, address: usize, destination: usize) -> u32 
 #[cfg(test)]
 mod test {
 	use super::*;
+	use crate::bin_utils::{apply_doclines, sync_sidecar};
 	use crate::data::text_script::{parse_doclines, tl_reverse_transform_script, tl_transform_script};
 	use crate::opcodes::{Choice, OpField, Opcode, Script, TLString};
 	use camino::{Utf8Path, Utf8PathBuf};
@@ -1420,5 +1421,136 @@ return pad: 0x00\n\
 			again.clone().into_script().unwrap().binary_serialise().unwrap(),
 			doc.clone().into_script().unwrap().binary_serialise().unwrap()
 		);
+	}
+
+	/// A hand-inserted instruction moves every address after it, so a text written before the
+	/// insertion no longer names its instructions. Applying it stays correct — the entries are paired
+	/// by kind and raw text — and `sync_sidecar` renumbers the tags to the layout the assembly has
+	/// now, so the two files keep naming the same instructions.
+	#[test]
+	fn a_text_written_before_an_insertion_still_applies() {
+		let before = "# cc-fkb asm 1\n# script T.WSC\n\n\
+textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"first line\"\n\
+\n\
+textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"second line\"\n\
+\n#trailer [ ]\n";
+		let (_dir, asm_path) = scratch(&[("T.WSC.asm", before)]);
+		let doc = parse_file(&asm_path);
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+
+		// The toolchain's own text for that assembly, with the second entry translated and the first
+		// left alone — so the pairing has to land by position, not by whichever address is near.
+		let sidecar = tl_transform_script(&doc.script).expect("transforming");
+		let first_at = doc.items[0].address;
+		let second_at = doc.items[1].address;
+		assert!(
+			sidecar.contains(&format!("[original text @ 0x{second_at:08X}]: second line")),
+			"{sidecar}"
+		);
+		let mut seen = 0;
+		let mut lines: Vec<String> = Vec::new();
+		for line in sidecar.lines() {
+			if line == "[translation]: " {
+				seen += 1;
+				lines.push(if seen == 2 {
+					"[translation]: TL 2".to_owned()
+				} else {
+					line.to_owned()
+				});
+			} else {
+				lines.push(line.to_owned());
+			}
+		}
+		let text_path = asm_path.with_extension("txt");
+		std::fs::write(&text_path, lines.join("\n")).expect("writing the text");
+
+		// An instruction is inserted between the two, by hand, which moves the second one.
+		let after = before.replace(
+			"text: \"first line\"\n\n",
+			"text: \"first line\"\n\nnop_yield pad: [ 0x00, 0x00 ]\n\n",
+		);
+		std::fs::write(&asm_path, &after).expect("writing the assembly");
+		let mut doc = parse_file(&asm_path);
+		assert!(doc.diagnostics.is_empty(), "{:#?}", doc.diagnostics);
+		assert!(doc.items[2].address > second_at, "the insertion pushed the second entry down");
+
+		// The stale text applies to the instruction it describes, not to its old address.
+		let stale = apply_doclines(&mut doc, &text_path).expect("applying the text");
+		assert!(stale > 0, "the text's second tag named the older layout");
+		let strings: Vec<Option<&str>> = doc
+			.script
+			.opcodes
+			.iter()
+			.map(|it| match it.fields.get(3) {
+				Some(OpField::String(text)) => text.translation.as_deref(),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(
+			strings,
+			vec![None, None, Some("TL 2%K%P")],
+			"the translation landed on the second entry, and only there"
+		);
+
+		// What `ccfkb_untransform` then does with the text: renumber its tags, keep everything else.
+		let printed = print_document(&doc, "T.WSC").expect("printing");
+		std::fs::write(&asm_path, printed).expect("writing the assembly");
+		let final_at = parse_file(&asm_path).items[2].address;
+		let renumbered = sync_sidecar(&text_path, &asm_path).expect("syncing the text");
+		assert!(renumbered > 0, "the moved tag was renumbered");
+		let text = std::fs::read_to_string(&text_path).expect("reading the text");
+		assert!(
+			text.contains(&format!("[original text @ 0x{final_at:08X}]: second line")),
+			"{text}"
+		);
+		assert!(
+			!text.contains(&format!("[original text @ 0x{second_at:08X}]")),
+			"the stale address is gone:\n{text}"
+		);
+		assert!(text.contains("[translation]: TL 2"), "the edit survived:\n{text}");
+		assert!(
+			text.contains(&format!(
+				"[original text @ 0x{first_at:08X}]: first line\n[translation]: \n"
+			)),
+			"the untouched entry is byte for byte what it was:\n{text}"
+		);
+	}
+
+	/// The pairing is a witness, not a guess: a text that no longer describes the assembly is refused
+	/// with the disagreement named, rather than applied to whichever instruction is nearest.
+	#[test]
+	fn a_text_that_no_longer_lines_up_is_refused() {
+		let before = "# cc-fkb asm 1\n# script T.WSC\n\n\
+textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"only line\"\n\
+\n#trailer [ ]\n";
+		let (_dir, asm_path) = scratch(&[("T.WSC.asm", before)]);
+		let doc = parse_file(&asm_path);
+		let sidecar = tl_transform_script(&doc.script).expect("transforming");
+		let text_path = asm_path.with_extension("txt");
+
+		// A text whose raw text is not the instruction's: the two files disagree.
+		std::fs::write(&text_path, sidecar.replace("]: only line", "]: another line"))
+			.expect("writing the text");
+		let mut stale = parse_file(&asm_path);
+		let err = apply_doclines(&mut stale, &text_path).expect_err("the raw texts disagree");
+		let message = format!("{err:#}");
+		assert!(message.contains("the text and the script disagree"), "{message}");
+		assert!(message.contains("another line") && message.contains("only line"), "{message}");
+
+		// A text that describes fewer text instructions than the assembly has.
+		std::fs::write(&text_path, &sidecar).expect("writing the text");
+		let after = before.replace(
+			"#trailer [ ]",
+			"textbox_no_speaker layout_id: 0x0114, mode: 0x01, timer_param: 0x00, text: \"added\"\n\n\
+#trailer [ ]",
+		);
+		std::fs::write(&asm_path, after).expect("writing the assembly");
+		let mut doc = parse_file(&asm_path);
+		let err = apply_doclines(&mut doc, &text_path)
+			.expect_err("the added instruction is undescribed");
+		let message = format!("{err:#}");
+		assert!(message.contains("textbox_no_speaker"), "{message}");
+		assert!(message.contains("the text describes 1"), "{message}");
+		assert!(message.contains("but the script has 2"), "{message}");
 	}
 }

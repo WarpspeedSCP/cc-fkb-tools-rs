@@ -95,7 +95,12 @@ fn reencode_from_assembly(
 		// the script.
 		let docline_file = script_folder.join(file_name).with_extension("txt");
 		if docline_file.is_file() {
-			apply_doclines(&mut doc, &docline_file)?;
+			let stale = apply_doclines(&mut doc, &docline_file)?;
+			if stale > 0 {
+				log::info!(
+					"{docline_file}: {stale} address tag(s) name an older layout; paired by kind and raw text"
+				);
+			}
 		}
 
 		let out_name = file
